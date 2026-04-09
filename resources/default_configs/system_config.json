@@ -1,0 +1,22 @@
+{
+  "llm_settings": {
+    "provider": "ollama",
+    "base_url": "http://localhost:11434/v1",
+    "model_name": "qwen3.5:9b",
+    "api_key": "optional_key_here"
+  },
+  "context_management": {
+    "hard_limit_tokens": 8192,
+    "soft_limit_tokens": 6000
+  },
+  "agent_safeguards": {
+    "max_repeated_loops": 3,
+    "inference_timeout_seconds": 180,
+    "tool_execution_timeout_seconds": 60
+  },
+  "mode_settings": {
+    "default_mode": "code",
+    "custom_modes": []
+  },
+  "system_prompt": "あなたは親切で有能なAIアシスタントです。ユーザーの質問に丁寧かつ正確に回答してください。"
+}

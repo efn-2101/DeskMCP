@@ -1,0 +1,110 @@
+# DeskToDo MCP Server 設定ファイルサンプル
+# このファイルを desktodo_config.yaml にコピーして編集してください。
+# 設定ファイルの検索順序:
+#   1. 環境変数 DESKTODO_CONFIG_FILE で指定されたパス
+#   2. ~/.desktodo/config.yaml（ユーザーホームディレクトリ）
+#   3. ./desktodo_config.yaml（カレントディレクトリ）
+
+# ============================================================================
+# データベース設定
+# ============================================================================
+database:
+  # データベースファイルのパス（オプション）
+  # 未指定の場合は環境変数 DESKTODO_DATA_DIR またはスクリプトと同一ディレクトリに保存
+  # 相対パスを使用する場合、MCPサーバー起動時のカレントディレクトリが基準となります
+  # 例: ./mydata/desktodo_tasks.db または mydata/desktodo_tasks.db
+  # path: ./mydata/desktodo_tasks.db
+  
+  # バックアップディレクトリ（オプション）
+  # 未指定の場合はデータベースと同一ディレクトリに保存
+  # 環境変数 DESKTODO_BACKUP_DIR で上書き可能
+  # 相対パスも使用可能です
+  # backup_dir: ./mydata/backups
+  
+  # 自動バックアップの間隔（時間単位、デフォルト: 24）
+  backup_interval_hours: 24
+
+# ============================================================================
+# ログ設定
+# ============================================================================
+logging:
+  # ログレベル: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  # 環境変数 DESKTODO_LOG_LEVEL で上書き可能
+  level: INFO
+  
+  # ログファイルのパス（オプション）
+  # 未指定の場合は標準エラー出力のみ
+  # 環境変数 DESKTODO_LOG_FILE で上書き可能
+  # file: /path/to/your/desktodo.log
+  
+  # ログファイルの最大サイズ（MB単位、デフォルト: 10）
+  max_size_mb: 10
+  
+  # ログファイルのバックアップ数（デフォルト: 5）
+  backup_count: 5
+
+# ============================================================================
+# デフォルト値設定
+# ============================================================================
+defaults:
+  # 新規タスクのデフォルト優先度: high, medium, low
+  priority: medium
+  
+  # 期日未指定時の自動設定（営業日数、デフォルト: 3）
+  business_days_for_due: 3
+  
+  # 一覧取得時のデフォルト件数上限（デフォルト: 100）
+  pagination_limit: 100
+  
+  # 新規タスクのデフォルトステータス
+  status: pending
+
+# ============================================================================
+# エンベディング検索設定
+# ============================================================================
+embedding:
+  # エンベディング検索の有効化（デフォルト: true）
+  # 環境変数 DESKTODO_EMBEDDING_ENABLED で上書き可能
+  enabled: true
+  
+  # エンベディングプロバイダ: ollama, lmstudio, openai_compatible
+  # 環境変数 DESKTODO_EMBEDDING_PROVIDER で上書き可能
+  provider: ollama
+  
+  # API URL（デフォルト: http://localhost:11434）
+  # 環境変数 DESKTODO_EMBEDDING_API_URL で上書き可能
+  api_url: http://localhost:11434
+  
+  # エンベディングモデル名（デフォルト: qwen3-embedding:0.6b）
+  # 環境変数 DESKTODO_EMBEDDING_MODEL で上書き可能
+  model: qwen3-embedding:0.6b
+
+# ============================================================================
+# その他の設定
+# ============================================================================
+# タイムゾーン（デフォルト: Asia/Tokyo）
+# 環境変数 TZ で上書き可能
+timezone: Asia/Tokyo
+
+# 言語設定（デフォルト: ja）
+# 環境変数 DESKTODO_LANG で上書き可能
+language: ja
+
+# ============================================================================
+# 環境変数一覧
+# ============================================================================
+# 以下の環境変数で設定を上書きできます:
+#
+# DESKTODO_CONFIG_FILE    - 設定ファイルのパス
+# DESKTODO_DATA_DIR       - データベースディレクトリ
+# DESKTODO_BACKUP_DIR     - バックアップディレクトリ
+# DESKTODO_LOG_FILE       - ログファイルのパス
+# DESKTODO_LOG_LEVEL       - ログレベル
+# DESKTODO_LANG           - 言語設定
+# TZ                      - タイムゾーン
+# DESKTODO_EMBEDDING_ENABLED  - エンベディング検索の有効化
+# DESKTODO_EMBEDDING_PROVIDER - エンベディングプロバイダ
+# DESKTODO_EMBEDDING_API_URL  - エンベディングAPI URL
+# DESKTODO_EMBEDDING_MODEL    - エンベディングモデル名
+# DESKTODO_ALLOWED_DIRS   - ファイル読み込み許可ディレクトリ（カンマ区切り）
+# DESKTODO_MAX_FILE_SIZE_MB - ファイル読み込み最大サイズ（MB）

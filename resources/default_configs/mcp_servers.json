@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "DeskToDo": {
+      "command": "python",
+      "args": ["desktodo_mcp.py"],
+      "cwd": "default_mcp_server/DeskToDo",
+      "env": {
+        "DESKTODO_DATA_DIR": "./mydata"
+      }
+    }
+  }
+}

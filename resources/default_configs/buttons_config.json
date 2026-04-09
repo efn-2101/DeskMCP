@@ -1,0 +1,52 @@
+{
+  "action_buttons": [
+    {
+      "id": "list_tasks",
+      "ui_label": "📋 タスク一覧",
+      "ui_description": "現在のタスクの一覧をシンプルに表示します",
+      "agent_persona": "secretary",
+      "task_instruction": "list_pending_tasksツールを使用して現在の保留中タスク一覧を取得し、Markdownテーブル形式で見やすく表示してください。",
+      "mcp_server": "DeskToDo"
+    },
+    {
+      "id": "check_tasks",
+      "ui_label": "🔍 タスクの確認",
+      "ui_description": "現在の抱えているタスク一覧と状況を確認します",
+      "agent_persona": "secretary",
+      "task_instruction": "現在のすべての保留中タスクを取得し、Markdownテーブル形式で一覧として見やすく表示してください。また、期限が近いものや優先度が高いなど、直近で着手すべきものがあればハイライトして教えてください。",
+      "mcp_server": "DeskToDo"
+    },
+    {
+      "id": "organize_tasks",
+      "ui_label": "🗂️ タスク整理",
+      "ui_description": "タスクの優先度付けと整理を提案します",
+      "agent_persona": "secretary",
+      "task_instruction": "現在のタスク一覧を分析し、優先順位の変更や関連タスクのグループ化などの整理案を提案してください。🚨【重要】提案は視覚的に瞬時に理解できるよう、必ず「比較表（Markdownテーブル形式：整理前 → 整理後 → 理由）」のみで出力し、前置きや不要な長文解説は一切書かないでください！提案への同意確認は最後に短く行ってください。",
+      "mcp_server": "DeskToDo"
+    },
+    {
+      "id": "breakdown_tasks",
+      "ui_label": "✂️ タスクの細分化",
+      "ui_description": "粒度が大きすぎるタスクを小さなサブタスクに分解する提案を行います",
+      "agent_persona": "secretary",
+      "task_instruction": "タスク一覧から粒度が大きすぎるタスクを見つけ、具体的なサブタスクに細分化する案を提示してください。🚨【重要】提案は直感的に判断できるよう、必ず「比較表（Markdownテーブル形式：元のタスク名 → 細分化されたサブタスク一覧（箇条書き） → 推奨理由）」のみで出力し、長ったらしい文章表現は絶対に避けてください。同意確認のみ最後に短く添えてください。",
+      "mcp_server": "DeskToDo"
+    },
+    {
+      "id": "update_rag_index",
+      "ui_label": "🔄 インデックス更新",
+      "ui_description": "ローカルRAGのドキュメントインデックスを最新状態に同期・更新します",
+      "agent_persona": "secretary",
+      "task_instruction": "ローカルRAGサーバー（local-rag）のupdate_indexツールを呼び出してインデックス更新を開始してください。このツールはバックグラウンドで同期を開始し、すぐに応答を返します。更新開始の応答を受け取った後、get_sync_statusツールを1回だけ呼び出して同期が開始されたことを確認し、ユーザーに開始済みであることを報告してください。🚨【重要】インデックス更新はバックグラウンドで実行されるため、完了を待機したり、ステータス確認ツールを繰り返し呼び出し（ポーリング）したり絶対にしないでください。get_sync_statusは1回だけ呼び出して終了してください。",
+      "mcp_server": "local-rag"
+    },
+    {
+      "id": "check_rag_index_status",
+      "ui_label": "📊 インデックス状況確認",
+      "ui_description": "現在のドキュメントインデックスの登録状況や最終更新日時を確認します",
+      "agent_persona": "secretary",
+      "task_instruction": "ローカルRAGサーバー（local-rag）のステータス確認ツール（またはそれに類するインデックス情報取得ツール）を呼び出し、現在のインデックス登録件数や最終更新日時などの情報を取得して、ユーザーにわかりやすく箇条書きで報告してください。",
+      "mcp_server": "local-rag"
+    }
+  ]
+}
