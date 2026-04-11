@@ -21,3 +21,6 @@ typing-extensions>=4.8.0
 
 # Environment variables loader
 python-dotenv>=1.0.0
+
+# YAML configuration file support (for DeskToDo MCP Server)
+pyyaml>=6.0

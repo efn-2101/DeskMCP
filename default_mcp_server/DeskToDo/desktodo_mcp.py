@@ -1021,13 +1021,13 @@ def parse_msg_file(filepath: str) -> str:
     logger = get_logger()
     
     try:
-        import ExtractMsg
+        import extract_msg
     except ImportError:
-        return "`.msg` ファイルを読むには `pip install ExtractMsg` が必要です"
+        return "`.msg` ファイルを読むには `pip install extract-msg` が必要です"
     
     try:
         # ExtractMsgでメールを開く
-        msg = ExtractMsg.openMsg(filepath)
+        msg = extract_msg.openMsg(filepath)
         
         # ヘッダー情報の抽出
         subject = msg.subject or '(件名なし)'

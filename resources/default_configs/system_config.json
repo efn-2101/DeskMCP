@@ -7,16 +7,31 @@
   },
   "context_management": {
     "hard_limit_tokens": 8192,
-    "soft_limit_tokens": 6000
+    "soft_limit_tokens": 6000,
+    "tool_definition_budget_tokens": 4000,
+    "message_history_budget_tokens": 2000
   },
   "agent_safeguards": {
     "max_repeated_loops": 3,
     "inference_timeout_seconds": 180,
     "tool_execution_timeout_seconds": 60
   },
+  "tool_filter_settings": {
+    "enabled": true,
+    "max_tools": 15,
+    "always_include": ["get_server_info"],
+    "compression_mode": "compact"
+  },
+  "system_prompt_settings": {
+    "use_enhanced_prompt": true,
+    "include_tool_guidelines": true
+  },
   "mode_settings": {
     "default_mode": "code",
     "custom_modes": []
+  },
+  "network_settings": {
+    "proxy_bypass_hosts": ["localhost", "127.0.0.1", "::1", "*.local"]
   },
   "system_prompt": "あなたは親切で有能なAIアシスタントです。ユーザーの質問に丁寧かつ正確に回答してください。"
 }

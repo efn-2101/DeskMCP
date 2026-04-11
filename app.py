@@ -19,6 +19,7 @@ import logging
 import json
 import os
 import shutil
+from pathlib import Path
 
 import chainlit as cl
 from chainlit.context import context_var
@@ -35,6 +36,86 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+# ============================================
+# プロキシバイパス設定
+# ============================================
+def setup_proxy_bypass():
+    """ローカルネットワークへの通信がプロキシ経由にならないよう、NO_PROXY環境変数を設定する。"""
+    
+    # system_config.jsonからproxy_bypass_hostsを読み込む
+    bypass_hosts = ["localhost", "127.0.0.1", "::1", "*.local"]  # デフォルト
+    
+    config_path = Path("config/system_config.json")
+    default_config_path = Path("resources/default_configs/system_config.json")
+    
+    config_file = config_path if config_path.exists() else default_config_path
+    if config_file.exists():
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            if "network_settings" in config and "proxy_bypass_hosts" in config["network_settings"]:
+                bypass_hosts = config["network_settings"]["proxy_bypass_hosts"]
+        except Exception:
+            pass  # 読み込み失敗時はデフォルトを使用
+    
+    # base_urlからホスト名を抽出してバイパスリストに追加
+    llm_config_path = Path("config/system_config.json")
+    llm_default_path = Path("resources/default_configs/system_config.json")
+    llm_file = llm_config_path if llm_config_path.exists() else llm_default_path
+    if llm_file.exists():
+        try:
+            with open(llm_file, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            base_url = config.get("llm_settings", {}).get("base_url", "")
+            if base_url:
+                from urllib.parse import urlparse
+                parsed = urlparse(base_url)
+                hostname = parsed.hostname
+                if hostname and hostname not in bypass_hosts:
+                    bypass_hosts.append(hostname)
+        except Exception:
+            pass
+    
+    # mcp_servers.jsonからSSE接続先のホスト名も抽出
+    mcp_config_path = Path("config/mcp_servers.json")
+    mcp_default_path = Path("resources/default_configs/mcp_servers.json")
+    mcp_file = mcp_config_path if mcp_config_path.exists() else mcp_default_path
+    if mcp_file.exists():
+        try:
+            with open(mcp_file, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            for server_name, server_config in config.get("mcpServers", {}).items():
+                url = server_config.get("url", "")
+                if url:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    hostname = parsed.hostname
+                    if hostname and hostname not in bypass_hosts:
+                        bypass_hosts.append(hostname)
+        except Exception:
+            pass
+    
+    # NO_PROXY環境変数を設定（既存値があれば追記）
+    no_proxy_value = ",".join(bypass_hosts)
+    existing = os.environ.get("NO_PROXY", "") or os.environ.get("no_proxy", "")
+    if existing:
+        # 既存のバイパスリストと重複を排除して結合
+        existing_hosts = [h.strip() for h in existing.split(",") if h.strip()]
+        for h in bypass_hosts:
+            if h not in existing_hosts:
+                existing_hosts.append(h)
+        no_proxy_value = ",".join(existing_hosts)
+    
+    os.environ["NO_PROXY"] = no_proxy_value
+    os.environ["no_proxy"] = no_proxy_value  # 大文字小文字両方に設定（httpxは小文字も確認する）
+    
+    logger.info(f"NO_PROXY環境変数を設定しました: {no_proxy_value}")
+
+
+# アプリ起動時にプロキシバイパスを設定
+setup_proxy_bypass()
 
 
 # ============================================
@@ -309,9 +390,10 @@ async def on_chat_start():
     
     try:
         # 【重要】Chainlitのネイティブなスレッド管理に任せるため、手動のcreate_threadやthread_idの上書きは絶対に行わない
-        mcp_manager = MCPClientManager()
-        await mcp_manager.connect_servers()
         system_config = load_system_config()
+        tool_filter_settings = system_config.get("tool_filter_settings", {})
+        mcp_manager = MCPClientManager(tool_filter_settings=tool_filter_settings)
+        await mcp_manager.connect_servers()
         agent_config = AgentConfig.from_dict(system_config)
         
         agent = Agent(mcp_manager=mcp_manager, config=agent_config)
@@ -347,9 +429,10 @@ async def on_chat_resume(thread: dict):
     
     try:
         # 1. MCPマネージャーと設定の再初期化
-        mcp_manager = MCPClientManager()
-        await mcp_manager.connect_servers()
         system_config = load_system_config()
+        tool_filter_settings = system_config.get("tool_filter_settings", {})
+        mcp_manager = MCPClientManager(tool_filter_settings=tool_filter_settings)
+        await mcp_manager.connect_servers()
         agent_config = AgentConfig.from_dict(system_config)
         
         # 2. 必須引数を渡してAgentを作成（ここがエラーの原因でした）
@@ -388,7 +471,7 @@ async def on_chat_resume(thread: dict):
 # ============================================
 # ユーザー入力処理コアロジック
 # ============================================
-async def _process_user_input(user_input: str) -> None:
+async def _process_user_input(user_input: str, server_name: str = None) -> None:
     """
     ユーザー入力の処理コアロジック
     
@@ -400,8 +483,11 @@ async def _process_user_input(user_input: str) -> None:
     
     Args:
         user_input: ユーザーからの入力テキスト
+        server_name: MCPサーバー名（指定時は該当サーバーのツールのみを使用）
     """
     logger.info(f"ユーザーメッセージ処理: {user_input[:50]}...")
+    if server_name:
+        logger.info(f"  サーバー指定: {server_name}")
     
     # セッションからAgentを取得
     agent: Agent = cl.user_session.get("agent")
@@ -417,7 +503,7 @@ async def _process_user_input(user_input: str) -> None:
         # すべてのロジック（推論、ツール実行、履歴管理）はAgent内で完結
         final_response = None
         
-        async for step in agent.run(user_input=user_input):
+        async for step in agent.run(user_input=user_input, server_name=server_name):
             # Agentからの応答を順次UIに表示
             # stepはChainlitのStepオブジェクト
             if hasattr(step, 'output') and step.output:
@@ -483,9 +569,21 @@ async def on_message(message: cl.Message):
 # マクロプロンプト注入ヘルパー
 # ============================================
 async def _inject_macro_prompt(btn_config: dict) -> None:
-    """マクロの指示をユーザーメッセージとしてチャットに送信し、通常の処理フローに乗せる"""
+    """
+    マクロの指示をユーザーメッセージとしてチャットに送信し、通常の処理フローに乗せる
+    
+    Args:
+        btn_config: ボタン設定辞書。以下のキーを含む:
+            - task_instruction: マクロの指示テキスト
+            - mcp_server: MCPサーバー名（オプション）
+    """
     instruction = btn_config.get("task_instruction", "")
     prompt = instruction
+    
+    # ボタン設定からMCPサーバー名を取得
+    server_name = btn_config.get("mcp_server")
+    if server_name:
+        logger.info(f"マクロ実行: サーバー指定あり -> {server_name}")
     
     # 古いメニューを消去
     old_menu = cl.user_session.get("action_menu_msg")
@@ -500,23 +598,34 @@ async def _inject_macro_prompt(btn_config: dict) -> None:
     msg = cl.Message(content=prompt, author="User")
     await msg.send()
     
-    # 【重要】アクションコールバックを即座に終了させるため、
-    # Chainlitのコンテキストを保持したまま _process_user_input をバックグラウンドタスクとして起動する
-    # デコレータ付きの on_message を直接呼ぶとChainlitの内部状態を破壊するため、
-    # プレーンな _process_user_input を呼び出す
     ctx = context_var.get()
     
+    # 【検証ログ】コンテキストとスレッドIDの状態を確認
+    logger.info(f"=== _inject_macro_prompt 検証ログ ===")
+    logger.info(f"  ctx type: {type(ctx)}")
+    logger.info(f"  ctx.session type: {type(ctx.session) if ctx else 'N/A'}")
+    logger.info(f"  ctx.session.thread_id: {ctx.session.thread_id if ctx and hasattr(ctx, 'session') else 'N/A'}")
+    logger.info(f"  cl.user_session thread_id: {cl.user_session.get('thread_id')}")
+    logger.info(f"  cl.context.session.thread_id: {cl.context.session.thread_id if hasattr(cl.context, 'session') else 'N/A'}")
+
     async def run_message_in_background():
+        # 【検証ログ】バックグラウンドタスク開始時の状態
+        logger.info(f"=== run_message_in_background 開始 ===")
         context_var.set(ctx)
-        # Chainlitのタスクライフサイクル管理: フロントエンドのローディング状態を正しく制御する
+        logger.info(f"  context_var.set(ctx) 完了")
+        logger.info(f"  context_var.get().session.thread_id: {context_var.get().session.thread_id if context_var.get() else 'N/A'}")
+        
         emitter = ctx.emitter
         await emitter.task_start()
+        logger.info(f"  emitter.task_start() 完了")
+        
         try:
-            await _process_user_input(prompt)
+            await _process_user_input(prompt, server_name=server_name)
         except Exception as e:
             logger.error(f"バックグラウンドマクロ処理エラー: {e}")
         finally:
             await emitter.task_end()
+            logger.info(f"=== run_message_in_background 終了 ===")
             
     asyncio.create_task(run_message_in_background())
 

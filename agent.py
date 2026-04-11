@@ -17,6 +17,7 @@ from typing import AsyncGenerator, Optional, Any
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
 import httpx
 
 import chainlit as cl
@@ -92,15 +93,88 @@ def _get_default_config() -> dict:
         },
         "context_management": {
             "hard_limit_tokens": 8192,
-            "soft_limit_tokens": 6000
+            "soft_limit_tokens": 6000,
+            "tool_definition_budget_tokens": 4000,
+            "message_history_budget_tokens": 2000
         },
         "agent_safeguards": {
             "max_repeated_loops": 3,
             "inference_timeout_seconds": 180,
             "tool_execution_timeout_seconds": 60
         },
+        "tool_filter_settings": {
+            "enabled": True,
+            "max_tools": 15,
+            "always_include": ["get_server_info"],
+            "compression_mode": "compact"
+        },
+        "system_prompt_settings": {
+            "use_enhanced_prompt": True,
+            "include_tool_guidelines": True
+        },
         "system_prompt": "あなたは親切で有能なAIアシスタントです。"
     }
+
+
+# ============================================
+# 強化版システムプロンプト
+# ============================================
+ENHANCED_SYSTEM_PROMPT_TEMPLATE = """
+あなたは親切で有能なAIアシスタントです。ユーザーの質問に丁寧かつ正確に回答してください。
+
+## ツール使用ガイドライン
+
+利用可能なツールカテゴリと使い分け基準：
+
+### タスク管理
+- **作成**: `add_task` - 新しいタスクを登録
+- **一覧**: `list_pending_tasks`（未完了のみ）, `list_all_tasks`（全て）
+- **更新**: `update_task_*` - 各フィールドを個別に更新
+- **完了**: `complete_task` - タスクを完了状態に
+- **削除**: `delete_task`（完全削除）, `archive_task`（アーカイブ）
+
+### 検索
+- **キーワード検索**: `search_tasks` - 単純な部分一致検索
+- **あいまい検索**: `fuzzy_search_tasks` - FTS5全文検索（関連度順）
+- **意味検索**: `semantic_search_tasks` - エンベディング使用（意味的類似性）
+- **高度な検索**: `search_tasks_advanced` - 複数条件・フィルタリング
+
+### 一括操作
+- `*_bulk` 系ツール - 複数タスクの一括処理
+
+### ファイル操作
+- `read_document_file` - メール・テキストファイルの読み込み
+
+## 重要な判断基準
+
+1. **検索ツールの選択**:
+   - 曖昧な表現・うろ覚え → `fuzzy_search_tasks` または `semantic_search_tasks`
+   - 明確なキーワード → `search_tasks`
+   - 複雑な条件 → `search_tasks_advanced`
+
+2. **一覧表示の選択**:
+   - 日常的な確認 → `list_pending_tasks`
+   - 履歴確認 → `list_all_tasks`
+   - 期限切れ確認 → `get_overdue_tasks`
+
+3. **削除の選択**:
+   - 復元不要 → `delete_task`
+   - 復元可能性あり → `archive_task`
+
+## 現在のシステム時刻
+{current_time}
+"""
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """辞書を深くマージ（プリセット適用用）"""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        elif key not in ["llm_presets", "active_preset"]:
+            result[key] = value
+    return result
 
 
 # ============================================
@@ -109,15 +183,32 @@ def _get_default_config() -> dict:
 @dataclass
 class AgentConfig:
     """エージェント設定"""
+    # セーフガード設定
     max_repeated_loops: int = 3
     inference_timeout_seconds: int = 180
     tool_execution_timeout_seconds: int = 60
+    
+    # コンテキスト管理設定
     hard_limit_tokens: int = 8192
     soft_limit_tokens: int = 6000
+    tool_definition_budget_tokens: int = 4000
+    message_history_budget_tokens: int = 2000
+    
+    # LLM設定
     base_url: str = "http://localhost:11434/v1"
     model_name: str = "gemma3:latest"
     api_key: str = "optional_key_here"
+    
+    # システムプロンプト設定
     system_prompt: str = "あなたは親切で有能なAIアシスタントです。"
+    use_enhanced_prompt: bool = True
+    include_tool_guidelines: bool = True
+    
+    # ツールフィルタ設定
+    tool_filter_enabled: bool = True
+    max_tools: int = 15
+    always_include: list = field(default_factory=lambda: ["get_server_info"])
+    compression_mode: str = "compact"  # full, compact, minimal
     
     @classmethod
     def from_dict(cls, config: dict) -> "AgentConfig":
@@ -125,17 +216,32 @@ class AgentConfig:
         llm_settings = config.get("llm_settings", {})
         context_mgmt = config.get("context_management", {})
         safeguards = config.get("agent_safeguards", {})
+        tool_filter = config.get("tool_filter_settings", {})
+        prompt_settings = config.get("system_prompt_settings", {})
         
         return cls(
+            # セーフガード
             max_repeated_loops=safeguards.get("max_repeated_loops", 3),
             inference_timeout_seconds=safeguards.get("inference_timeout_seconds", 180),
             tool_execution_timeout_seconds=safeguards.get("tool_execution_timeout_seconds", 60),
+            # コンテキスト管理
             hard_limit_tokens=context_mgmt.get("hard_limit_tokens", 8192),
             soft_limit_tokens=context_mgmt.get("soft_limit_tokens", 6000),
+            tool_definition_budget_tokens=context_mgmt.get("tool_definition_budget_tokens", 4000),
+            message_history_budget_tokens=context_mgmt.get("message_history_budget_tokens", 2000),
+            # LLM設定
             base_url=llm_settings.get("base_url", "http://localhost:11434/v1"),
             model_name=llm_settings.get("model_name", "gemma3:latest"),
             api_key=llm_settings.get("api_key", "optional_key_here"),
-            system_prompt=config.get("system_prompt", "あなたは親切で有能なAIアシスタントです。")
+            # システムプロンプト
+            system_prompt=config.get("system_prompt", "あなたは親切で有能なAIアシスタントです。"),
+            use_enhanced_prompt=prompt_settings.get("use_enhanced_prompt", True),
+            include_tool_guidelines=prompt_settings.get("include_tool_guidelines", True),
+            # ツールフィルタ
+            tool_filter_enabled=tool_filter.get("enabled", True),
+            max_tools=tool_filter.get("max_tools", 15),
+            always_include=tool_filter.get("always_include", ["get_server_info"]),
+            compression_mode=tool_filter.get("compression_mode", "compact")
         )
 
 
@@ -396,21 +502,37 @@ class Agent:
         
         self.config = config
         
-        # 現在時刻を動的に追加したシステムプロンプトを構築
+        # 強化版システムプロンプトを構築
         current_time = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+        
+        if config.use_enhanced_prompt:
+            # 強化版プロンプトを使用（ツールガイドライン付き）
+            if config.include_tool_guidelines:
+                dynamic_system_prompt = ENHANCED_SYSTEM_PROMPT_TEMPLATE.format(current_time=current_time)
+            else:
+                # ツールガイドラインなしの強化版
+                dynamic_system_prompt = f"""あなたは親切で有能なAIアシスタントです。
+ユーザーの質問に丁寧かつ正確に回答してください。
+
+## 現在のシステム時刻
+{current_time}
+"""
+        else:
+            # 従来のプロンプトを使用
         dynamic_system_prompt = config.system_prompt + f"\n\n[System Info]\n現在のシステム時刻は {current_time} です。時間に関する質問にはこの時刻を基準に回答してください。"
         
         self.history = MessageHistory(system_prompt=dynamic_system_prompt)
         self._cancel_requested = False  # キルスイッチ用フラグ
         self._tool_call_counter = {}  # 連続呼び出し検知用
         self._rejection_occurred = False  # ユーザー拒否発生フラグ（LLM暴走防止用）
+        self._initial_user_input = None  # 初回ユーザー入力保存用（ツールフィルタリング用）
         
         logger.info(f"エージェント初期化完了: model={config.model_name}, base_url={config.base_url}")
     
     # ============================================
     # メインループ
     # ============================================
-    async def run(self, user_input: str) -> AsyncGenerator[Any, None]:
+    async def run(self, user_input: str, server_name: str = None) -> AsyncGenerator[Any, None]:
         """
         自律エージェントのメインループ
         
@@ -419,10 +541,14 @@ class Agent:
         
         Args:
             user_input: ユーザーからの入力テキスト
+            server_name: MCPサーバー名（指定時は該当サーバーのツールのみを使用）
             
         Yields:
             Chainlit Step/Message オブジェクト
         """
+        # サーバー名をインスタンス変数に保存
+        self._server_name = server_name
+        
         # ユーザー入力を履歴に追加
         self.history.add_user_message(user_input)
         self._cancel_requested = False
@@ -445,7 +571,13 @@ class Agent:
                 
                 try:
                     # LLMにコンテキストを送信し、応答を取得
-                    llm_response = await self._call_llm()
+                    # 初回のユーザー入力を保存し、2回目以降もツールフィルタリングに使用
+                    if loop_count == 1:
+                        self._initial_user_input = user_input
+                        filter_input = user_input
+                    else:
+                        filter_input = self._initial_user_input
+                    llm_response = await self._call_llm(user_input=filter_input)
                     
                     # 【診断ログ】LLM応答の詳細を記録
                     logger.debug(f"[診断] LLM応答: content={llm_response.content[:100] if llm_response.content else 'None'}, tool_calls={len(llm_response.tool_calls)}, finish_reason={llm_response.finish_reason}")
@@ -594,17 +726,27 @@ class Agent:
     # ============================================
     # 内部メソッド（プライベート）
     # ============================================
-    async def _call_llm(self) -> LLMResponse:
+    async def _call_llm(self, user_input: str = None) -> LLMResponse:
         """
         LLMへのAPI呼び出し
         
         OpenAI互換API（Ollama/vLLM/LM Studio）へのリクエスト実装
         
+        Args:
+            user_input: ユーザー入力（ツールフィルタリング用、オプション）
+        
         Returns:
             LLM応答
         """
-        # ツール定義を取得
-        tools = await self.mcp_manager.get_tools_for_llm()
+        # ツール定義を取得（フィルタリング設定を適用）
+        # サーバー名が指定されている場合は該当サーバーのツールのみを取得
+        tools = await self.mcp_manager.get_tools_for_llm(
+            user_input=user_input,
+            max_tools=self.config.max_tools if self.config.tool_filter_enabled else None,
+            compression_mode=self.config.compression_mode if self.config.tool_filter_enabled else "full",
+            always_include=self.config.always_include if self.config.tool_filter_enabled else None,
+            server_name=getattr(self, '_server_name', None)
+        )
         
         # リクエストボディを構築
         request_body = {
@@ -629,7 +771,14 @@ class Agent:
         # タイムアウト設定
         timeout = httpx.Timeout(self.config.inference_timeout_seconds)
         
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        # ローカル接続先かどうかを判定し、ローカルの場合はプロキシを無効化
+        _client_kwargs = {"timeout": timeout}
+        _base_hostname = urlparse(self.config.base_url).hostname if self.config.base_url else None
+        _local_hostnames = {"localhost", "127.0.0.1", "::1"}
+        if _base_hostname in _local_hostnames or (_base_hostname and _base_hostname.endswith(".local")):
+            _client_kwargs["proxy"] = None
+        
+        async with httpx.AsyncClient(**_client_kwargs) as client:
             try:
                 logger.debug(f"LLMリクエスト送信: {self.config.base_url}/chat/completions")
                 response = await client.post(
