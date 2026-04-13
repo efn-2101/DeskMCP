@@ -244,11 +244,11 @@ class SQLiteDataLayer(BaseDataLayer):
                 logger.warning(f"スレッドが存在しないため更新をスキップします: thread_id={thread_id}")
                 return True
             
-                # 既存スレッドの更新
-                if "name" in kwargs and kwargs["name"] is not None:
-                    await db.execute("UPDATE threads SET name = ? WHERE id = ?", (kwargs["name"], thread_id))
-                if "metadata" in kwargs and kwargs["metadata"] is not None:
-                    await db.execute("UPDATE threads SET metadata = ? WHERE id = ?", (json.dumps(kwargs["metadata"]), thread_id))
+            # 既存スレッドの更新
+            if "name" in kwargs and kwargs["name"] is not None:
+                await db.execute("UPDATE threads SET name = ? WHERE id = ?", (kwargs["name"], thread_id))
+            if "metadata" in kwargs and kwargs["metadata"] is not None:
+                await db.execute("UPDATE threads SET metadata = ? WHERE id = ?", (json.dumps(kwargs["metadata"]), thread_id))
             await db.commit()
             logger.info(f"  スレッド更新成功: thread_id={thread_id}")
         return True

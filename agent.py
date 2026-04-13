@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import shutil
+import ipaddress
 from typing import AsyncGenerator, Optional, Any
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -114,6 +115,82 @@ def _get_default_config() -> dict:
         },
         "system_prompt": "あなたは親切で有能なAIアシスタントです。"
     }
+
+
+# ============================================
+# プロキシバイパス設定ヘルパー関数
+# ============================================
+def get_proxy_bypass_hosts() -> set:
+    """プロキシバイパス対象のホスト名セットを取得
+    
+    以下の順序で設定をマージ:
+    1. デフォルトのローカルホスト
+    2. NO_PROXY/no_proxy環境変数
+    3. system_config.jsonのproxy_bypass_hosts
+    """
+    bypass_hosts = {"localhost", "127.0.0.1", "::1"}
+    
+    # 環境変数から取得
+    no_proxy = os.environ.get("NO_PROXY", "") or os.environ.get("no_proxy", "")
+    if no_proxy:
+        bypass_hosts.update(h.strip() for h in no_proxy.split(",") if h.strip())
+    
+    # 設定ファイルから取得
+    config_path = Path("config/system_config.json")
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            hosts = config.get("network_settings", {}).get("proxy_bypass_hosts", [])
+            bypass_hosts.update(hosts)
+        except Exception:
+            pass
+    
+    return bypass_hosts
+
+
+def is_private_ip(hostname: str) -> bool:
+    """プライベートIPアドレスかどうかを判定
+    
+    プライベートIP範囲:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    """
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return ip.is_private
+    except ValueError:
+        return False
+
+
+def should_bypass_proxy(hostname: str) -> bool:
+    """プロキシをバイパスすべきかどうかを判定"""
+    if not hostname:
+        return False
+    
+    bypass_hosts = get_proxy_bypass_hosts()
+    
+    # ホスト名がバイパスリストに含まれるか
+    if hostname in bypass_hosts:
+        return True
+    
+    # .localドメイン
+    if hostname.endswith(".local"):
+        return True
+    
+    # ワイルドカードマッチ (*.example.com形式)
+    for pattern in bypass_hosts:
+        if pattern.startswith("*."):
+            domain = pattern[2:]
+            if hostname.endswith(domain) or hostname == domain[1:]:
+                return True
+    
+    # プライベートIPアドレス
+    if is_private_ip(hostname):
+        return True
+    
+    return False
 
 
 # ============================================
@@ -519,7 +596,7 @@ class Agent:
 """
         else:
             # 従来のプロンプトを使用
-        dynamic_system_prompt = config.system_prompt + f"\n\n[System Info]\n現在のシステム時刻は {current_time} です。時間に関する質問にはこの時刻を基準に回答してください。"
+            dynamic_system_prompt = config.system_prompt + f"\n\n[System Info]\n現在のシステム時刻は {current_time} です。時間に関する質問にはこの時刻を基準に回答してください。"
         
         self.history = MessageHistory(system_prompt=dynamic_system_prompt)
         self._cancel_requested = False  # キルスイッチ用フラグ
@@ -774,8 +851,7 @@ class Agent:
         # ローカル接続先かどうかを判定し、ローカルの場合はプロキシを無効化
         _client_kwargs = {"timeout": timeout}
         _base_hostname = urlparse(self.config.base_url).hostname if self.config.base_url else None
-        _local_hostnames = {"localhost", "127.0.0.1", "::1"}
-        if _base_hostname in _local_hostnames or (_base_hostname and _base_hostname.endswith(".local")):
+        if should_bypass_proxy(_base_hostname):
             _client_kwargs["proxy"] = None
         
         async with httpx.AsyncClient(**_client_kwargs) as client:

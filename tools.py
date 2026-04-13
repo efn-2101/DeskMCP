@@ -15,6 +15,7 @@ import os
 import shutil
 import re
 import fnmatch
+import ipaddress
 from typing import Optional, Any, List
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,82 @@ try:
 except ImportError:
     MCP_AVAILABLE = False
     logger.warning("MCPパッケージが利用できません。pip install mcp を実行してください")
+
+
+# ============================================
+# プロキシバイパス設定ヘルパー関数
+# ============================================
+def get_proxy_bypass_hosts() -> set:
+    """プロキシバイパス対象のホスト名セットを取得
+    
+    以下の順序で設定をマージ:
+    1. デフォルトのローカルホスト
+    2. NO_PROXY/no_proxy環境変数
+    3. system_config.jsonのproxy_bypass_hosts
+    """
+    bypass_hosts = {"localhost", "127.0.0.1", "::1"}
+    
+    # 環境変数から取得
+    no_proxy = os.environ.get("NO_PROXY", "") or os.environ.get("no_proxy", "")
+    if no_proxy:
+        bypass_hosts.update(h.strip() for h in no_proxy.split(",") if h.strip())
+    
+    # 設定ファイルから取得
+    config_path = Path("config/system_config.json")
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            hosts = config.get("network_settings", {}).get("proxy_bypass_hosts", [])
+            bypass_hosts.update(hosts)
+        except Exception:
+            pass
+    
+    return bypass_hosts
+
+
+def is_private_ip(hostname: str) -> bool:
+    """プライベートIPアドレスかどうかを判定
+    
+    プライベートIP範囲:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    """
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return ip.is_private
+    except ValueError:
+        return False
+
+
+def should_bypass_proxy(hostname: str) -> bool:
+    """プロキシをバイパスすべきかどうかを判定"""
+    if not hostname:
+        return False
+    
+    bypass_hosts = get_proxy_bypass_hosts()
+    
+    # ホスト名がバイパスリストに含まれるか
+    if hostname in bypass_hosts:
+        return True
+    
+    # .localドメイン
+    if hostname.endswith(".local"):
+        return True
+    
+    # ワイルドカードマッチ (*.example.com形式)
+    for pattern in bypass_hosts:
+        if pattern.startswith("*."):
+            domain = pattern[2:]
+            if hostname.endswith(domain) or hostname == domain[1:]:
+                return True
+    
+    # プライベートIPアドレス
+    if is_private_ip(hostname):
+        return True
+    
+    return False
 
 
 # ============================================
@@ -590,14 +667,12 @@ class MCPServerConnection:
             from urllib.parse import urlparse as _urlparse
             _parsed_url = _urlparse(self.config.url)
             _hostname = _parsed_url.hostname
-            if _hostname:
-                _local_hostnames = {"localhost", "127.0.0.1", "::1"}
-                if _hostname in _local_hostnames or _hostname.endswith(".local"):
-                    _current_no_proxy = os.environ.get("NO_PROXY", "") or os.environ.get("no_proxy", "")
-                    if _hostname not in _current_no_proxy.split(","):
-                        _new_value = f"{_current_no_proxy},{_hostname}".lstrip(",")
-                        os.environ["NO_PROXY"] = _new_value
-                        os.environ["no_proxy"] = _new_value
+            if _hostname and should_bypass_proxy(_hostname):
+                _current_no_proxy = os.environ.get("NO_PROXY", "") or os.environ.get("no_proxy", "")
+                if _hostname not in _current_no_proxy.split(","):
+                    _new_value = f"{_current_no_proxy},{_hostname}".lstrip(",")
+                    os.environ["NO_PROXY"] = _new_value
+                    os.environ["no_proxy"] = _new_value
         
         if transport == "sse":
             # SSEトランスポート接続
