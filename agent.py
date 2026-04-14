@@ -853,7 +853,8 @@ class Agent:
         _base_hostname = urlparse(self.config.base_url).hostname if self.config.base_url else None
         if should_bypass_proxy(_base_hostname):
             _client_kwargs["proxy"] = None
-        
+            _client_kwargs["trust_env"] = False  # 環境変数のプロキシ設定を無視
+
         async with httpx.AsyncClient(**_client_kwargs) as client:
             try:
                 logger.debug(f"LLMリクエスト送信: {self.config.base_url}/chat/completions")

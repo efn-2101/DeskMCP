@@ -662,17 +662,35 @@ class MCPServerConnection:
         transport = self.config.transport_type
         logger.info(f"MCPサーバー '{self.config.name}' に接続します (transport: {transport})")
         
+        # SSE接続用のカスタムHTTPクライアントファクトリ
+        _httpx_client_factory = None
         if transport == "sse" and self.config.url:
-            # SSE接続先がローカルネットワークの場合、プロキシバイパスを確実に設定
+            # SSE接続先がローカルネットワークの場合、プロキシを無効化したクライアントを使用
             from urllib.parse import urlparse as _urlparse
+            import httpx
             _parsed_url = _urlparse(self.config.url)
             _hostname = _parsed_url.hostname
             if _hostname and should_bypass_proxy(_hostname):
-                _current_no_proxy = os.environ.get("NO_PROXY", "") or os.environ.get("no_proxy", "")
-                if _hostname not in _current_no_proxy.split(","):
-                    _new_value = f"{_current_no_proxy},{_hostname}".lstrip(",")
-                    os.environ["NO_PROXY"] = _new_value
-                    os.environ["no_proxy"] = _new_value
+                # プロキシを無効化するカスタムクライアントファクトリを作成
+                def _create_no_proxy_client(
+                    headers: dict[str, str] | None = None,
+                    timeout: httpx.Timeout | None = None,
+                    auth: httpx.Auth | None = None,
+                ) -> httpx.AsyncClient:
+                    kwargs: dict[str, Any] = {
+                        "follow_redirects": True,
+                        "proxy": None,
+                        "trust_env": False,  # 環境変数のプロキシ設定を無視
+                    }
+                    if timeout is not None:
+                        kwargs["timeout"] = timeout
+                    if headers is not None:
+                        kwargs["headers"] = headers
+                    if auth is not None:
+                        kwargs["auth"] = auth
+                    return httpx.AsyncClient(**kwargs)
+                _httpx_client_factory = _create_no_proxy_client
+                logger.debug(f"SSE接続でプロキシを無効化: {_hostname}")
         
         if transport == "sse":
             # SSEトランスポート接続
@@ -681,7 +699,8 @@ class MCPServerConnection:
             
             self._cm = sse_client(
                 url=self.config.url,
-                headers=self.config.headers if self.config.headers else None
+                headers=self.config.headers if self.config.headers else None,
+                httpx_client_factory=_httpx_client_factory
             )
         else:
             # Stdioトランスポート接続
