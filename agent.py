@@ -222,6 +222,27 @@ ENHANCED_SYSTEM_PROMPT_TEMPLATE = """
 ### ファイル操作
 - `read_document_file` - メール・テキストファイルの読み込み
 
+## サーバー別ツール選択ガイド
+
+ユーザーが特定のサーバーとの通信確認や操作を求めた場合、適切なサーバーのツールを選択してください。
+
+### Redmine（チケット管理）
+- **通信確認・接続テスト**: `getIssues` または `getProjects` を使用
+- **チケット検索**: `getIssues` を使用
+- **プロジェクト一覧**: `getProjects` を使用
+- **チケット詳細取得**: `getIssue` を使用
+
+### DeskToDo（タスク管理）
+- **通信確認**: `list_pending_tasks` を使用
+- **タスク追加**: `add_task` を使用
+- **タスク一覧**: `list_pending_tasks` または `list_all_tasks` を使用
+
+### local-rag（ドキュメント検索）
+- **通信確認**: `list_roots` または `list_documents` を使用
+- **ドキュメント検索**: `search_documents` を使用
+
+**重要**: ユーザーが「Redmine」と明示的に言及した場合、Redmineサーバーのツール（getIssues, getProjects等）を優先的に使用してください。
+
 ## 重要な判断基準
 
 1. **検索ツールの選択**:
@@ -252,6 +273,103 @@ def deep_merge(base: dict, override: dict) -> dict:
         elif key not in ["llm_presets", "active_preset"]:
             result[key] = value
     return result
+
+
+# ============================================
+# 動的システムプロンプト生成
+# ============================================
+class DynamicSystemPromptGenerator:
+    """システムプロンプト動的生成クラス"""
+    
+    def __init__(self, mcp_manager):
+        """
+        初期化
+        
+        Args:
+            mcp_manager: MCPClientManagerインスタンス
+        """
+        self.mcp_manager = mcp_manager
+    
+    async def generate(self, base_prompt: str = None) -> str:
+        """
+        接続済みサーバのツール一覧から動的にプロンプトを生成
+        
+        Args:
+            base_prompt: ベースとなるプロンプト（Noneの場合はデフォルト）
+            
+        Returns:
+            生成されたシステムプロンプト
+        """
+        tools = await self.mcp_manager.get_all_tools()
+        server_names = self.mcp_manager.get_server_names()
+        
+        # サーバ別にツールを分類
+        tools_by_server = {}
+        for tool in tools:
+            if tool.server_name not in tools_by_server:
+                tools_by_server[tool.server_name] = []
+            tools_by_server[tool.server_name].append(tool)
+        
+        # プロンプト構築
+        sections = []
+        
+        # ベースプロンプト
+        if base_prompt:
+            sections.append(base_prompt)
+        else:
+            sections.append("あなたは親切で有能なAIアシスタントです。")
+        
+        # ツール使用ガイドライン
+        sections.append("\n## 利用可能なMCPサーバとツール\n")
+        
+        for server_name in server_names:
+            server_tools = tools_by_server.get(server_name, [])
+            if not server_tools:
+                continue
+            
+            sections.append(f"\n### {server_name}\n")
+            
+            # ツールをカテゴリ別に分類
+            categories = self._categorize_tools(server_tools)
+            for category_name, category_tools in categories.items():
+                sections.append(f"- **{category_name}**: ")
+                tool_names = [f"`{t.name}`" for t in category_tools[:5]]
+                sections.append(", ".join(tool_names))
+                if len(category_tools) > 5:
+                    sections.append(f" 他{len(category_tools) - 5}件")
+                sections.append("\n")
+        
+        # 現在時刻
+        current_time = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+        sections.append(f"\n## 現在のシステム時刻\n{current_time}\n")
+        
+        return "".join(sections)
+    
+    def _categorize_tools(self, tools: list) -> dict:
+        """ツールをカテゴ���別に分類"""
+        categories = {
+            "作成・追加": [],
+            "参照・検索": [],
+            "更新・変更": [],
+            "削除・アーカイブ": [],
+            "その他": []
+        }
+        
+        for tool in tools:
+            name_lower = tool.name.lower()
+            if any(kw in name_lower for kw in ["add", "create", "new", "追加", "作成", "register"]):
+                categories["作成・追加"].append(tool)
+            elif any(kw in name_lower for kw in ["get", "list", "search", "find", "一覧", "検索", "fetch", "query"]):
+                categories["参照・検索"].append(tool)
+            elif any(kw in name_lower for kw in ["update", "change", "modify", "更新", "変更"]):
+                categories["更新・変更"].append(tool)
+            elif any(kw in name_lower for kw in ["delete", "remove", "archive", "削除", "アーカイブ"]):
+                categories["削除・アーカイブ"].append(tool)
+            else:
+                categories["その他"].append(tool)
+        
+        # 空カテゴリを除外
+        return {k: v for k, v in categories.items() if v}
 
 
 # ============================================
@@ -579,32 +697,70 @@ class Agent:
         
         self.config = config
         
-        # 強化版システムプロンプトを構築
-        current_time = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+        # 動的プロンプト生成器
+        self._prompt_generator = DynamicSystemPromptGenerator(mcp_manager)
+        self._dynamic_prompt_generated = False  # 動的プロンプト生成済みフラグ
         
-        if config.use_enhanced_prompt:
-            # 強化版プロンプトを使用（ツールガイドライン付き）
-            if config.include_tool_guidelines:
-                dynamic_system_prompt = ENHANCED_SYSTEM_PROMPT_TEMPLATE.format(current_time=current_time)
-            else:
-                # ツールガイドラインなしの強化版
-                dynamic_system_prompt = f"""あなたは親切で有能なAIアシスタントです。
+        # 初期システムプロンプトを構築（後で動的に更新）
+        current_time = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+        initial_prompt = f"""あなたは親切で有能なAIアシスタントです。
 ユーザーの質問に丁寧かつ正確に回答してください。
 
 ## 現在のシステム時刻
 {current_time}
+
+※ 接続中のMCPサーバのツール一覧は、初回の会話時に動的に追加されます。
 """
-        else:
-            # 従来のプロンプトを使用
-            dynamic_system_prompt = config.system_prompt + f"\n\n[System Info]\n現在のシステム時刻は {current_time} です。時間に関する質問にはこの時刻を基準に回答してください。"
         
-        self.history = MessageHistory(system_prompt=dynamic_system_prompt)
+        self.history = MessageHistory(system_prompt=initial_prompt)
         self._cancel_requested = False  # キルスイッチ用フラグ
         self._tool_call_counter = {}  # 連続呼び出し検知用
         self._rejection_occurred = False  # ユーザー拒否発生フラグ（LLM暴走防止用）
         self._initial_user_input = None  # 初回ユーザー入力保存用（ツールフィルタリング用）
         
         logger.info(f"エージェント初期化完了: model={config.model_name}, base_url={config.base_url}")
+    
+    async def _ensure_dynamic_prompt(self):
+        """
+        動的システムプロンプトが生成されていない場合に生成する
+        
+        MCPサーバ接続後にツール一覧を取得してプロンプトを動的に更新
+        """
+        if self._dynamic_prompt_generated:
+            return
+        
+        try:
+            # 動的プロンプトを生成
+            base_prompt = self.config.system_prompt if self.config.system_prompt else None
+            
+            if self.config.use_enhanced_prompt:
+                # 強化版プロンプトを使用
+                dynamic_prompt = await self._prompt_generator.generate(base_prompt)
+            else:
+                # シンプルなプロンプト
+                current_time = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+                dynamic_prompt = f"""{base_prompt or 'あなたは親切で有能なAIアシスタントです。'}
+
+## 現在のシステム時刻
+{current_time}
+"""
+            
+            # 履歴のシステムプロンプトを更新
+            self.history.messages[0] = {"role": "system", "content": dynamic_prompt}
+            self._dynamic_prompt_generated = True
+            
+            logger.info("動的システムプロンプトを生成しました")
+            
+        except Exception as e:
+            logger.warning(f"動的プロンプト生成に失敗、デフォルトプロンプトを使用: {e}")
+            # フォールバック: 静的プロンプトを使用
+            current_time = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+            if self.config.use_enhanced_prompt and self.config.include_tool_guidelines:
+                fallback_prompt = ENHANCED_SYSTEM_PROMPT_TEMPLATE.format(current_time=current_time)
+            else:
+                fallback_prompt = self.config.system_prompt + f"\n\n[System Info]\n現在のシステム時刻は {current_time} です。"
+            
+            self.history.messages[0] = {"role": "system", "content": fallback_prompt}
     
     # ============================================
     # メインループ
@@ -625,6 +781,9 @@ class Agent:
         """
         # サーバー名をインスタンス変数に保存
         self._server_name = server_name
+        
+        # 動的システムプロンプトが未生成の場合は生成
+        await self._ensure_dynamic_prompt()
         
         # ユーザー入力を履歴に追加
         self.history.add_user_message(user_input)
