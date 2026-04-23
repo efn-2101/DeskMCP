@@ -389,6 +389,13 @@ class AgentConfig:
     tool_definition_budget_tokens: int = 4000
     message_history_budget_tokens: int = 2000
     
+    # ツール結果Pruning設定
+    tool_result_read_max_chars: int = 4000
+    tool_result_write_max_chars: int = 2000
+    tool_result_info_max_chars: int = 1000
+    tool_result_default_max_chars: int = 3000
+    pruning_soft_limit_tokens: int = 2000
+    
     # LLM設定
     base_url: str = "http://localhost:11434/v1"
     model_name: str = "gemma3:latest"
@@ -414,6 +421,9 @@ class AgentConfig:
         tool_filter = config.get("tool_filter_settings", {})
         prompt_settings = config.get("system_prompt_settings", {})
         
+        # ツール結果Pruning設定（ネストされた設定を読み込み）
+        tool_pruning = context_mgmt.get("tool_result_pruning", {})
+        
         return cls(
             # セーフガード
             max_repeated_loops=safeguards.get("max_repeated_loops", 3),
@@ -424,6 +434,12 @@ class AgentConfig:
             soft_limit_tokens=context_mgmt.get("soft_limit_tokens", 6000),
             tool_definition_budget_tokens=context_mgmt.get("tool_definition_budget_tokens", 4000),
             message_history_budget_tokens=context_mgmt.get("message_history_budget_tokens", 2000),
+            # ツール結果Pruning設定
+            tool_result_read_max_chars=tool_pruning.get("read_max_chars", 4000),
+            tool_result_write_max_chars=tool_pruning.get("write_max_chars", 2000),
+            tool_result_info_max_chars=tool_pruning.get("info_max_chars", 1000),
+            tool_result_default_max_chars=tool_pruning.get("default_max_chars", 3000),
+            pruning_soft_limit_tokens=tool_pruning.get("soft_limit_tokens", 2000),
             # LLM設定
             base_url=llm_settings.get("base_url", "http://localhost:11434/v1"),
             model_name=llm_settings.get("model_name", "gemma3:latest"),
@@ -467,16 +483,27 @@ class MessageHistory:
     巨大なツール実行結果は「結果の要約」に置換するPruningを実装
     """
     
-    def __init__(self, system_prompt: str = ""):
+    def __init__(self, system_prompt: str = "",
+                 hard_limit_tokens: int = 8192,
+                 soft_limit_tokens: int = 6000,
+                 message_history_budget_tokens: int = 2000):
         """
         初期化
         
         Args:
             system_prompt: システムプロンプト
+            hard_limit_tokens: ハードリミット（トークン数）
+            soft_limit_tokens: ソフトリミット（トークン数）
+            message_history_budget_tokens: メッセージ履歴の予算（トークン数）
         """
         self.messages: list[dict] = []
         self._system_prompt = system_prompt
         self._tool_call_history: list[dict] = []  # ループ検知用
+        
+        # コンテキスト予算
+        self._hard_limit_tokens = hard_limit_tokens
+        self._soft_limit_tokens = soft_limit_tokens
+        self._message_history_budget_tokens = message_history_budget_tokens
         
         # システムプロンプトを追加
         if system_prompt:
@@ -586,17 +613,24 @@ class MessageHistory:
         """
         コンテンツのPruning処理
         
-        仕様書6.3: 即時OOMの防止（上限ガード）
-        - 大きなコンテンツは要約に置換
-        - トークン数の概算（1トークン ≈ 2-4文字）
+        仕様書6.3: 即時OOMの防止（上限ガード���
+        - ソフトリミット超過時は先頭保持の切り詰め
+        - ハードリミットはprune_large_contentで対応
+        
+        Args:
+            content: 対象コンテンツ
+            summary: 要約テキスト（後方互換のため残すが使用しない）
         """
         # 簡易的なトークン数推定（日本語は約2文字/トークン、英語は約4文字/トークン）
         estimated_tokens = len(content) / 3
         
-        # ソフトリミットを超える場合は要約を使用
-        if estimated_tokens > 1000:  # 約1000トークン以上の場合
-            logger.info(f"コンテンツをPruning: {estimated_tokens:.0f}トークン -> 要約")
-            return summary
+        # ソフトリミット超過時は先頭保持の切り詰め
+        soft_limit_tokens = 2000  # デフォルト値（設定値はAgentConfigから取得予定）
+        soft_limit_chars = soft_limit_tokens * 3  # ≈6000文字
+        
+        if estimated_tokens > soft_limit_tokens:
+            logger.info(f"コンテンツをPruning: {estimated_tokens:.0f}トークン -> {soft_limit_tokens}トークンに切り詰め")
+            return content[:soft_limit_chars] + "\n... [コンテキスト予算のため省略]"
         
         return content
     
@@ -625,12 +659,175 @@ class MessageHistory:
     
     def get_context_for_llm(self) -> list:
         """
-        LLMに渡すためのコンテキストを取得
+        LLMに渡すためのコンテキストを取得（予算ベースのトリミング付き）
+        
+        優先度順にメッセージを保持:
+        1. system プロンプト（最優先、常に保持）
+        2. 最新の user メッセージ（現在のタスク）
+        3. 最新の assistant メッセージ
+        4. 古いメッセージから順に予算内で保持
         
         Returns:
             OpenAI形式のメッセージリスト
         """
-        return self.messages.copy()
+        # 現在の総トークン数を推定
+        total_tokens = self._estimate_total_tokens()
+        
+        # 予算内ならそのまま返す
+        if total_tokens <= self._soft_limit_tokens:
+            return self.messages.copy()
+        
+        # 予算超過時のトリミング
+        return self._trim_to_budget()
+    
+    def _estimate_total_tokens(self) -> int:
+        """メッセージ履歴の総トークン数を推定"""
+        total = 0
+        for msg in self.messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total += len(content) / 3
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        total += len(item.get("text", "")) / 3
+            
+            # tool_callsのトークン数も推定
+            tool_calls = msg.get("tool_calls", [])
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                total += len(func.get("name", "")) / 3
+                total += len(func.get("arguments", "")) / 3
+        
+        return int(total)
+    
+    def _estimate_messages_tokens(self, messages: list) -> int:
+        """メッセージリストのトークン数を推定"""
+        total = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total += len(content) / 3
+            tool_calls = msg.get("tool_calls", [])
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                total += len(func.get("name", "")) / 3
+                total += len(func.get("arguments", "")) / 3
+        return int(total)
+    
+    def _summarize_message(self, msg: dict) -> dict | None:
+        """
+        メッセージを要約版に変換
+        
+        - tool メッセージ: 先頭300文字に切り詰め
+        - assistant メッセージ: 先頭200文字に切り詰め
+        - user メッセージ: 先頭200文字に切り詰め
+        """
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        
+        if not isinstance(content, str):
+            return None
+        
+        if role == "tool":
+            if len(content) > 300:
+                return {**msg, "content": content[:300] + "\n... [要約]"}
+        elif role == "assistant":
+            if len(content) > 200:
+                return {**msg, "content": content[:200] + "\n... [要約]"}
+        elif role == "user":
+            if len(content) > 200:
+                return {**msg, "content": content[:200] + "\n... [要約]"}
+        
+        return None
+    
+    def _trim_to_budget(self) -> list:
+        """
+        予算内に収まるようメッセージをトリミング
+        
+        戦略:
+        1. system メッセージは常に保持
+        2. 最新の user メッセージは常に保持
+        3. 古いメッセージから順に、soft_limit→要約、hard_limit→削除
+        """
+        result = []
+        system_msgs = []
+        latest_user_msg = None
+        
+        # 優先メッセージの分離
+        for msg in self.messages:
+            if msg.get("role") == "system":
+                system_msgs.append(msg)
+            elif msg.get("role") == "user":
+                latest_user_msg = msg  # 最後のuserメッセージを保持
+        
+        # 残りのメッセージ（古い順）
+        other_msgs = [m for m in self.messages
+                      if m not in system_msgs and m is not latest_user_msg]
+        
+        # 優先メッセージのトークン数
+        priority_tokens = self._estimate_messages_tokens(system_msgs)
+        if latest_user_msg:
+            priority_tokens += self._estimate_messages_tokens([latest_user_msg])
+        
+        # 残り予算
+        remaining_budget = self._soft_limit_tokens - priority_tokens
+        
+        # 新しい順にメッセージを追加（予算内で）
+        added_msgs = []
+        for msg in reversed(other_msgs):
+            msg_tokens = self._estimate_messages_tokens([msg])
+            if remaining_budget >= msg_tokens:
+                added_msgs.append(msg)
+                remaining_budget -= msg_tokens
+            else:
+                # 予算不足: 要約に置換
+                summarized = self._summarize_message(msg)
+                if summarized:
+                    summarized_tokens = self._estimate_messages_tokens([summarized])
+                    if remaining_budget >= summarized_tokens:
+                        added_msgs.append(summarized)
+                        remaining_budget -= summarized_tokens
+                break  # これ以上古いメッセージは追加しない
+        
+        # 構築: system + 古い順のother + latest_user
+        added_msgs.reverse()
+        result = system_msgs + added_msgs
+        if latest_user_msg:
+            result.append(latest_user_msg)
+        
+        # hard_limitの最終チェック
+        total = self._estimate_messages_tokens(result)
+        if total > self._hard_limit_tokens:
+            # hard_limit超過: 最も古いotherメッセージから削除
+            result = self._enforce_hard_limit(result, system_msgs, latest_user_msg)
+        
+        logger.info(f"コンテキスト予算トリミング: {self._estimate_total_tokens()} -> "
+                    f"{self._estimate_messages_tokens(result)} トークン")
+        
+        return result
+    
+    def _enforce_hard_limit(self, messages: list, system_msgs: list, latest_user_msg: dict | None) -> list:
+        """hard_limitを強制適用: system + latest_user以外の古いメッセージから削除"""
+        # system_msgsとlatest_user_msgは固定
+        fixed = system_msgs + ([latest_user_msg] if latest_user_msg else [])
+        fixed_tokens = self._estimate_messages_tokens(fixed)
+        
+        remaining = self._hard_limit_tokens - fixed_tokens
+        other = [m for m in messages if m not in fixed]
+        
+        # 新しい順に予算内で保持
+        kept = []
+        for msg in reversed(other):
+            msg_tokens = self._estimate_messages_tokens([msg])
+            if remaining >= msg_tokens:
+                kept.append(msg)
+                remaining -= msg_tokens
+            else:
+                break
+        
+        kept.reverse()
+        return fixed + kept
     
     def check_loop_detection(self, current_tool_calls: list[ToolCall], max_loops: int) -> bool:
         """
@@ -1190,11 +1387,61 @@ class Agent:
         
         return result
     
+    def _categorize_tool(self, tool_name: str) -> str:
+        """
+        ツール名からカテゴリを判定
+        
+        Args:
+            tool_name: ツール名
+            
+        Returns:
+            "read" / "write" / "info" / "default"
+        """
+        name_lower = tool_name.lower()
+        
+        # 情報系（メタデータのみ返すツール）- 先に判定（get_系より優先）
+        if any(name_lower.startswith(p) for p in
+               ["get_server_info", "get_task_statistics", "get_config", "backup_"]):
+            return "info"
+        
+        # 参照系（データを読み取るツール）
+        if any(name_lower.startswith(p) for p in
+               ["list_", "get_", "search_", "fuzzy_", "semantic_", "read_", "show_"]):
+            return "read"
+        
+        # 更新系（データを変更するツール）
+        if any(name_lower.startswith(p) for p in
+               ["add_", "update_", "delete_", "create_", "remove_", "complete_", "archive_", "restore_"]):
+            return "write"
+        
+        return "default"
+    
+    def _get_tool_result_max_chars(self, tool_name: str) -> int:
+        """
+        ツール名に基づいて結果の最大文字数を返す
+        
+        Args:
+            tool_name: ツール名（例: "list_pending_tasks"）
+            
+        Returns:
+            最大文字数
+        """
+        category = self._categorize_tool(tool_name)
+        limits = {
+            "read": self.config.tool_result_read_max_chars,
+            "write": self.config.tool_result_write_max_chars,
+            "info": self.config.tool_result_info_max_chars,
+            "default": self.config.tool_result_default_max_chars,
+        }
+        return limits.get(category, self.config.tool_result_default_max_chars)
+    
     def _summarize_tool_result(self, tool_name: str, raw_result: dict) -> str:
         """
         ツール実行結果の要約（Pruning用）
         
         仕様書6.3に基づく要約生成
+        - ツールカテゴリ別の文字数上限で先頭保持+省略表示
+        - 500文字以下の結果はそのまま保持
         
         Args:
             tool_name: ツール名
@@ -1217,9 +1464,17 @@ class Agent:
         else:
             result_text = str(raw_result)
         
-        # 長い場合は要約形式に変換
-        if len(result_text) > 500:
-            return f"[{tool_name}] 実行完了（データは読み込み済み）"
+        # ツールカテゴリ別の閾値を取得
+        max_chars = self._get_tool_result_max_chars(tool_name)
+        
+        # 500文字以下はそのまま保持
+        if len(result_text) <= 500:
+            return result_text
+        
+        # 閾値超過時は先頭保持の切り詰め
+        if len(result_text) > max_chars:
+            logger.info(f"ツール結果をPruning: {tool_name} ({len(result_text)}文字 -> {max_chars}文字)")
+            return result_text[:max_chars] + f"\n... [続きは省略されました。全{len(result_text)}文字中{max_chars}文字表示]"
         
         return result_text
     

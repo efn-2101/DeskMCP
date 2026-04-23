@@ -520,31 +520,17 @@ class ToolSchema:
         Returns:
             モードに応じた説明文
         """
-        if mode == "minimal":
-            return self.short_description or self.name
-        elif mode == "compact":
-            return self._extract_compact_description()
-        return self.description
+        if mode == "full":
+            return self.description
+        return ToolDescriptionCompressor.compress(self.description, mode, short_description=self.short_description)
     
     def _extract_compact_description(self) -> str:
-        """詳細説明から簡易版を抽出"""
+        """詳細説明から簡易版を抽出（非推奨: ToolDescriptionCompressorに統一済み）"""
         if self.short_description:
             return self.short_description
         
-        # docstringの最初の段落（要約部分）を抽出
-        lines = self.description.split('\n')
-        summary_lines = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                if summary_lines:
-                    break
-                continue
-            if stripped.startswith('【') or stripped.startswith('Args:') or stripped.startswith('Returns:'):
-                break
-            summary_lines.append(stripped)
-        
-        return ' '.join(summary_lines) if summary_lines else self.name
+        # ToolDescriptionCompressorに処理を委譲（二重圧縮バグの修正と連動）
+        return ToolDescriptionCompressor._extract_compact(self.description)
     
     def matches(self, query: str) -> bool:
         """
@@ -564,6 +550,99 @@ class ToolSchema:
         return False
 
 
+# ============================================
+# short_description自動生成ヘルパー関数
+# ============================================
+
+# 既知のツール名マッピング
+_KNOWN_TOOL_NAMES = {
+    "add_task": "タスクを新規登録",
+    "list_pending_tasks": "未完了タスク一覧を取得",
+    "list_all_tasks": "全タスク一覧を取得",
+    "update_task_title": "タスクのタイトルを変更",
+    "update_task_description": "タスクの説明を変更",
+    "update_task_priority": "タスクの優先度を変更",
+    "update_task_category": "タスクのカテゴリを変更",
+    "update_task_status": "タスクのステータスを変更",
+    "update_task_date": "タスクの期日を変更",
+    "complete_task": "タスクを完了に変更",
+    "archive_task": "タスクをアーカイブ",
+    "restore_task": "アーカイブ済みタスクを復元",
+    "delete_task": "タスクを完全に削除",
+    "search_tasks": "キーワードでタスクを検索",
+    "fuzzy_search_tasks": "あいまい検索でタスクを検索",
+    "semantic_search_tasks": "意味検索でタスクを検索",
+    "search_tasks_advanced": "複数条件でタスクを高度に検索",
+    "search_tasks_by_content_fragments": "断片的キーワードからタスクを検索",
+    "get_task_history": "タスクの変更履歴を取得",
+    "get_overdue_tasks": "期限切れタスク一覧を取得",
+    "get_tasks_by_date_range": "指定期間のタスクを取得",
+    "get_task_statistics": "タスクの統計情報を取得",
+    "get_recent_tasks": "最近登録されたタスクを取得",
+    "get_completed_tasks": "完了済みタスク一覧を取得",
+    "get_recently_modified_tasks": "最近更新されたタスクを取得",
+    "get_all_unique_words": "タスク内のユニーク単語一覧を取得",
+    "add_tasks_bulk": "複数タスクを一括登録",
+    "delete_tasks_bulk": "複数タスクを一括削除",
+    "update_tasks_status_bulk": "複数タスクのステータスを一括変更",
+    "update_tasks_due_date_bulk": "複数タスクの期日を一括変更",
+    "backup_database": "データベースのバックアップを作成",
+    "get_server_info": "サーバー情報を取得",
+    "read_document_file": "ファイルを読み込みテキストデータを返す",
+}
+
+
+def _generate_short_description(description: str, tool_name: str) -> str:
+    """
+    docstringからshort_descriptionを自動生成
+    
+    抽出ルール:
+    1. 最初の非空行（要約行）を抽出
+    2. 【】で始まる行はスキップ（セクション見出しなので）
+    3. 最大100文字
+    4. 抽出できない場合はツール名から推測
+    
+    Args:
+        description: ツールのdocstring
+        tool_name: ツール名（フォールバック用）
+        
+    Returns:
+        自動生成されたshort_description
+    """
+    if not description:
+        return _infer_short_description_from_name(tool_name)
+    
+    lines = description.split('\n')
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # セクション見出しはスキップ
+        if stripped.startswith('【') or stripped.startswith('Args') or stripped.startswith('Returns'):
+            continue
+        # 最初の意味のある行をshort_descriptionに
+        return stripped[:100]
+    
+    # 抽出できない場合はツール名から推測
+    return _infer_short_description_from_name(tool_name)
+
+
+def _infer_short_description_from_name(tool_name: str) -> str:
+    """
+    ツール名からshort_descriptionを推測
+    
+    例:
+    - add_task → "タスク追加"
+    - list_pending_tasks → "未完了タスク一覧"
+    - get_server_info → "サーバー情報取得"
+    """
+    if tool_name in _KNOWN_TOOL_NAMES:
+        return _KNOWN_TOOL_NAMES[tool_name]
+    
+    # 未知のツール名: アンダースコア区切りをスペースに変換
+    return tool_name.replace('_', ' ')
+
+
 class ToolDescriptionCompressor:
     """ツール説明の圧縮を行うクラス"""
     
@@ -577,26 +656,29 @@ class ToolDescriptionCompressor:
     ]
     
     @classmethod
-    def compress(cls, description: str, mode: str = "compact") -> str:
+    def compress(cls, description: str, mode: str = "compact", short_description: str = "") -> str:
         """
         ツール説明を圧縮
         
         Args:
             description: 元の説明文
             mode: "compact"（約50%削減）, "minimal"（約80%削減）
+            short_description: 簡易説明（minimalモードで優先使用）
             
         Returns:
             圧縮された説明文
         """
         if mode == "minimal":
-            return cls._extract_minimal(description)
+            return cls._extract_minimal(description, short_description)
         elif mode == "compact":
             return cls._extract_compact(description)
         return description
     
     @classmethod
-    def _extract_minimal(cls, description: str) -> str:
+    def _extract_minimal(cls, description: str, short_description: str = "") -> str:
         """最小限の説明を抽出（1行）"""
+        if short_description:
+            return short_description
         lines = description.split('\n')
         for line in lines:
             stripped = line.strip()
@@ -606,17 +688,105 @@ class ToolDescriptionCompressor:
     
     @classmethod
     def _extract_compact(cls, description: str) -> str:
-        """簡易説明を抽出（使用場面のみ）"""
-        # 【使用場面】セクションを抽出
-        match = re.search(r'【使用場面】(.*?)(?=【|$)', description, re.DOTALL)
-        if match:
-            usage = match.group(1).strip()
-            # 改行を削除して1行に
-            usage = ' '.join(usage.split())
-            return usage[:300]  # 最大300文字
+        """
+        簡易説明を抽出（使用場面 + パラメータ要約 + 注意点1行 + 使い分け1行）
         
-        # セクションがない場合は最初の段落
-        return cls._extract_minimal(description)
+        改修仕様:
+        - 【使用場面】セクションを主内容として保持
+        - 【パラメータ】セクションの要約（パラメータ名と型のみ）を追加
+        - 【注意点】の最初の1行を追加
+        - 【他のツールとの使い分け】の最初の1行を追加
+        - 上限を500文字に引き上げ
+        """
+        MAX_COMPACT_CHARS = 500
+        
+        sections = cls._extract_sections(description)
+        
+        parts = []
+        
+        # 1. 【使用場面】セクション（主内容）
+        usage = sections.get("使用場面", "")
+        if usage:
+            parts.append(f"【使用場面】{usage}")
+        
+        # 2. 【パラメータ】セクションの要約
+        params = sections.get("パラメータ", "")
+        if params:
+            param_summary = cls._summarize_params(params)
+            parts.append(f"【パラメータ】{param_summary}")
+        
+        # 3. 【注意点】の最初の1行
+        notes = sections.get("注意点", "")
+        if notes:
+            first_note = notes.split('\n')[0].strip()
+            # 先頭の "- " や "・" を除去
+            first_note = re.sub(r'^[-・]\s*', '', first_note)
+            if first_note:
+                parts.append(f"【注意点】{first_note}")
+        
+        # 4. 【他のツールとの使い分け】の最初の1行
+        diff = sections.get("他のツールとの使い分け", "")
+        if diff:
+            first_diff = diff.split('\n')[0].strip()
+            first_diff = re.sub(r'^[-・]\s*', '', first_diff)
+            if first_diff:
+                parts.append(f"【使い分け】{first_diff}")
+        
+        result = ' '.join(parts)
+        
+        # 500文字制限（厳密に500文字以下に収める）
+        if len(result) > MAX_COMPACT_CHARS:
+            result = result[:MAX_COMPACT_CHARS - 3] + "..."
+        
+        return result if result else cls._extract_minimal(description)
+    
+    @classmethod
+    def _extract_sections(cls, description: str) -> dict:
+        """
+        説明文から【】セクションを抽出して辞書で返す
+        
+        Returns:
+            キーがセクション名（「」内）、値がセクション内容の辞書
+        """
+        sections = {}
+        # 全セクションを正規表現で抽出
+        pattern = r'【(.*?)】(.*?)(?=【|$)'
+        for match in re.finditer(pattern, description, re.DOTALL):
+            section_name = match.group(1).strip()
+            section_content = match.group(2).strip()
+            # 改行をスペースに正規化
+            section_content = ' '.join(section_content.split())
+            sections[section_name] = section_content
+        return sections
+    
+    @classmethod
+    def _summarize_params(cls, params_text: str) -> str:
+        """
+        パラメータセクションを要約
+        
+        入力例: "task_id: 対象のタスクID（必須）, new_title: 新しいタイトル（必須、空文字不可）, reason: 変更理由（オプション）"
+        出力例: "task_id(必須), new_title(必須), reason(オプション)"
+        """
+        # カンマまたは改行でパラメータ単位に分割
+        param_items = re.split(r'[,、\n]', params_text)
+        summaries = []
+        for item in param_items:
+            item = item.strip()
+            if not item:
+                continue
+            # "param_name: 説明（必須）" → "param_name(必須)" に要約
+            # 必須/オプションの抽出
+            req_match = re.search(r'[（(](必須|オプション|任意)[)）]', item)
+            name_match = re.match(r'(\w+)\s*[:：]', item)
+            
+            if name_match:
+                name = name_match.group(1)
+                if req_match:
+                    summaries.append(f"{name}({req_match.group(1)})")
+                else:
+                    summaries.append(name)
+        
+        return ', '.join(summaries) if summaries else params_text[:100]
 
 
 # ============================================
@@ -1691,10 +1861,14 @@ class MCPServerConnection:
         # ツールスキーマを変換（server_nameを設定）
         self.tools = []
         for tool in tools_result.tools:
+            desc = tool.description or ""
+            # short_descriptionをdocstringの最初の1行から自動生成
+            short_desc = _generate_short_description(desc, tool.name)
             self.tools.append(ToolSchema(
                 name=tool.name,
-                description=tool.description or "",
+                description=desc,
                 input_schema=tool.inputSchema if hasattr(tool, 'inputSchema') else {},
+                short_description=short_desc,
                 server_name=self.config.name  # サーバー名を設定
             ))
         
@@ -2192,12 +2366,12 @@ class MCPClientManager:
         logger.info(f"[診断] フィルタリング結果: {len(filtered_tools)}件, ツール名: {[t.name for t in filtered_tools]}")
         
         # OpenAI形式に変換（説明圧縮を適用）
+        # get_description()がToolDescriptionCompressor.compress()に委譲する
+        # 単一エントリポイントとなっているため、二重圧縮を避けるため
+        # 直接Compressorを呼ばずget_description()を使用する
         tools = []
         for tool in filtered_tools:
             description = tool.get_description(comp_mode)
-            # 圧縮モードが有効な場合は圧縮処理を適用
-            if comp_mode in ("compact", "minimal"):
-                description = ToolDescriptionCompressor.compress(tool.description, comp_mode)
             
             tools.append({
                 "type": "function",
@@ -2229,9 +2403,6 @@ class MCPClientManager:
         result = []
         for tool in tools:
             description = tool.get_description(compression_mode)
-            # 圧縮モードが有効な場合は圧縮処理を適用
-            if compression_mode in ("compact", "minimal"):
-                description = ToolDescriptionCompressor.compress(tool.description, compression_mode)
             
             result.append({
                 "type": "function",

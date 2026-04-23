@@ -9,7 +9,14 @@
     "hard_limit_tokens": 8192,
     "soft_limit_tokens": 6000,
     "tool_definition_budget_tokens": 4000,
-    "message_history_budget_tokens": 2000
+    "message_history_budget_tokens": 2000,
+    "tool_result_pruning": {
+      "read_max_chars": 4000,
+      "write_max_chars": 2000,
+      "info_max_chars": 1000,
+      "default_max_chars": 3000,
+      "soft_limit_tokens": 2000
+    }
   },
   "agent_safeguards": {
     "max_repeated_loops": 3,
@@ -20,7 +27,7 @@
     "enabled": true,
     "max_tools": 15,
     "always_include": ["get_server_info"],
-    "compression_mode": "compact"
+    "compression_mode": "full"
   },
   "system_prompt_settings": {
     "use_enhanced_prompt": true,
