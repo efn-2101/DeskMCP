@@ -1564,6 +1564,59 @@ class ToolFilter:
 
 
 # ============================================
+# スキーマ型解決ヘルパー関数
+# ============================================
+def _resolve_schema_type(prop_schema: dict) -> tuple[str | None, dict]:
+    """
+    anyOf/oneOf/allOf を解決して実効的な型とスキーマを返す。
+    戻り値: (resolved_type, resolved_schema)
+    """
+    if not isinstance(prop_schema, dict):
+        return None, prop_schema
+    
+    # type が直接あればそのまま返す
+    if "type" in prop_schema:
+        return prop_schema["type"], prop_schema
+    
+    # anyOf / oneOf / allOf を順に試行
+    for key in ("anyOf", "oneOf", "allOf"):
+        if key in prop_schema and isinstance(prop_schema[key], list) and len(prop_schema[key]) > 0:
+            sub_schemas = prop_schema[key]
+            # null 型を除外して最初の非 null スキーマを選択
+            non_null = [s for s in sub_schemas if isinstance(s, dict) and s.get("type") != "null"]
+            if non_null:
+                chosen = non_null[0]
+                # 親スキーマの description, enum, default などを継承
+                merged = {**prop_schema, **chosen}
+                merged.pop(key, None)
+                return chosen.get("type"), merged
+            # 全部 null なら null を返す
+            return "null", prop_schema
+    
+    return None, prop_schema
+
+
+def _simplify_schema_for_llm(schema: dict) -> dict:
+    """MCPスキーマをOpenAI互換に簡略化する"""
+    if not isinstance(schema, dict):
+        return schema
+    # まず anyOf/oneOf を解決
+    _, resolved = _resolve_schema_type(schema)
+    if not isinstance(resolved, dict):
+        return resolved
+    result = dict(resolved)
+    if "properties" in result and isinstance(result["properties"], dict):
+        new_props = {}
+        for key, prop in result["properties"].items():
+            new_props[key] = _simplify_schema_for_llm(prop)
+        result["properties"] = new_props
+    # items スキーマも再帰的に簡略化
+    if "items" in result and isinstance(result["items"], dict):
+        result["items"] = _simplify_schema_for_llm(result["items"])
+    return result
+
+
+# ============================================
 # デフォルトパラメータ値生成クラス
 # ============================================
 class DefaultParameterValueGenerator:
@@ -1584,7 +1637,9 @@ class DefaultParameterValueGenerator:
         if "const" in prop_schema:
             return prop_schema["const"]
         
-        prop_type = prop_schema.get("type", "string")
+        prop_type, resolved_schema = _resolve_schema_type(prop_schema)
+        if prop_type is None:
+            prop_type = "string"
         
         if prop_type == "string":
             # enumがある場合は最初の値を使用
@@ -1937,17 +1992,17 @@ class MCPServerConnection:
         
         # スキーマで定義された全てのプロパティを処理
         for key, prop_schema in schema_props.items():
-            prop_type = prop_schema.get("type")
+            resolved_type, resolved_schema = _resolve_schema_type(prop_schema)
             value = arguments.get(key) if arguments else None
             
             # type: "object"のプロパティに対して正規化
-            if prop_type == "object":
+            if resolved_type == "object":
                 if value is None:
                     # None、undefined、または引数が渡されていない場合
                     if key in required_props:
                         # 必須引数の場合は空オブジェクトを設定し、ネストされた必須プロパティも処理
                         logger.info(f"[正規化] 必須引数 '{key}' が未指定のため空オブジェクトで初期化")
-                        normalized[key] = self._normalize_nested_object({}, prop_schema)
+                        normalized[key] = self._normalize_nested_object({}, resolved_schema)
                     else:
                         # オプション引数の場合はNoneのまま
                         normalized[key] = None
@@ -1957,10 +2012,24 @@ class MCPServerConnection:
                         logger.info(f"[正規化] 引数 '{key}' を空オブジェクトに変換 (元の値: 文字列'{value}')")
                     else:
                         logger.info(f"[正規化] 引数 '{key}' を空オブジェクトに変換 (元の値: 空文字)")
-                    normalized[key] = self._normalize_nested_object({}, prop_schema)
+                    normalized[key] = self._normalize_nested_object({}, resolved_schema)
                 elif isinstance(value, dict):
                     # 辞書の場合は再帰的に正規化
-                    normalized[key] = self._normalize_nested_object(value, prop_schema)
+                    normalized[key] = self._normalize_nested_object(value, resolved_schema)
+                else:
+                    normalized[key] = value
+            elif resolved_type in ("array",):
+                if value is None:
+                    normalized[key] = []
+                elif isinstance(value, list):
+                    items_schema = resolved_schema.get("items")
+                    if items_schema:
+                        normalized[key] = [
+                            self._normalize_value(item, items_schema)
+                            for item in value
+                        ]
+                    else:
+                        normalized[key] = value
                 else:
                     normalized[key] = value
             else:
@@ -1973,6 +2042,55 @@ class MCPServerConnection:
                     normalized[key] = value
         
         return normalized
+    
+    def _normalize_value(self, value: Any, prop_schema: dict) -> Any:
+        """
+        単一値に対して正規化を適用するヘルパー
+        
+        Args:
+            value: 正規化対象の値
+            prop_schema: プロパティのスキーマ定義
+            
+        Returns:
+            正規化された値
+        """
+        resolved_type, resolved_schema = _resolve_schema_type(prop_schema)
+        
+        if resolved_type == "object":
+            if value is None:
+                return {}
+            elif isinstance(value, dict):
+                return self._normalize_nested_object(value, resolved_schema)
+            else:
+                return value
+        elif resolved_type in ("array",):
+            if value is None:
+                return []
+            elif isinstance(value, list):
+                items_schema = resolved_schema.get("items")
+                if items_schema:
+                    return [self._normalize_value(item, items_schema) for item in value]
+                else:
+                    return value
+            else:
+                return value
+        elif resolved_type == "string":
+            if value is None:
+                enum_values = resolved_schema.get("enum")
+                if enum_values and len(enum_values) > 0:
+                    return enum_values[0]
+                return ""
+            return value
+        elif resolved_type in ("number", "integer"):
+            if value is None:
+                return 0
+            return value
+        elif resolved_type == "boolean":
+            if value is None:
+                return False
+            return value
+        else:
+            return value
     
     def _normalize_nested_object(self, obj: dict, schema: dict) -> dict:
         """
@@ -2000,12 +2118,12 @@ class MCPServerConnection:
         
         # スキーマで定義された全てのプロパティを処理
         for key, prop_schema in schema_props.items():
-            prop_type = prop_schema.get("type")
+            resolved_type, resolved_schema = _resolve_schema_type(prop_schema)
             value = obj.get(key)
             
             # const制約がある場合、その値を使用
-            if "const" in prop_schema:
-                const_value = prop_schema["const"]
+            if "const" in resolved_schema:
+                const_value = resolved_schema["const"]
                 if value is None:
                     logger.info(f"[正規化] 引数 '{key}' が未指定のためconst制約の値 '{const_value}' を設定")
                     normalized[key] = const_value
@@ -2013,7 +2131,7 @@ class MCPServerConnection:
                     normalized[key] = value
                 continue
             
-            elif prop_type == "object":
+            if resolved_type == "object":
                 # ネストされたオブジェクトの再帰処理
                 if value is None:
                     # object型のプロパティで値がnullの場合、空オブジェクトを設定
@@ -2025,14 +2143,14 @@ class MCPServerConnection:
                     normalized[key] = {}
                 elif isinstance(value, dict):
                     # 再帰的に処理
-                    normalized[key] = self._normalize_nested_object(value, prop_schema)
+                    normalized[key] = self._normalize_nested_object(value, resolved_schema)
                 else:
                     normalized[key] = value
-            elif prop_type == "string":
+            elif resolved_type == "string":
                 # 文字列型のプロパティに対するデフォルト値設定
                 if value is None:
                     # enumがある場合は最初の値を使用
-                    enum_values = prop_schema.get("enum")
+                    enum_values = resolved_schema.get("enum")
                     if enum_values and len(enum_values) > 0:
                         default_value = enum_values[0]
                         logger.info(f"[正規化] 引数 '{key}' が未指定のためenumの最初の値 '{default_value}' を設定")
@@ -2043,21 +2161,30 @@ class MCPServerConnection:
                         normalized[key] = ""
                 else:
                     normalized[key] = value
-            elif prop_type in ("array",):
+            elif resolved_type in ("array",):
                 # 配列型のプロパティに対するデフォルト値設定
                 if value is None:
                     logger.info(f"[正規化] 引数 '{key}' が未指定のため空配列を設定")
                     normalized[key] = []
+                elif isinstance(value, list):
+                    items_schema = resolved_schema.get("items")
+                    if items_schema:
+                        normalized[key] = [
+                            self._normalize_value(item, items_schema)
+                            for item in value
+                        ]
+                    else:
+                        normalized[key] = value
                 else:
                     normalized[key] = value
-            elif prop_type in ("number", "integer"):
+            elif resolved_type in ("number", "integer"):
                 # 数値型のプロパティに対するデフォルト値設定
                 if value is None:
                     logger.info(f"[正規化] 引数 '{key}' が未指定のため0を設定")
                     normalized[key] = 0
                 else:
                     normalized[key] = value
-            elif prop_type == "boolean":
+            elif resolved_type == "boolean":
                 # 真偽型のプロパティに対するデフォルト値設定
                 if value is None:
                     logger.info(f"[正規化] 引数 '{key}' が未指定のためFalseを設定")
@@ -2372,13 +2499,14 @@ class MCPClientManager:
         tools = []
         for tool in filtered_tools:
             description = tool.get_description(comp_mode)
+            simplified_schema = _simplify_schema_for_llm(tool.input_schema)
             
             tools.append({
                 "type": "function",
                 "function": {
                     "name": tool.name,
                     "description": description,
-                    "parameters": tool.input_schema
+                    "parameters": simplified_schema
                 }
             })
         
@@ -2403,13 +2531,14 @@ class MCPClientManager:
         result = []
         for tool in tools:
             description = tool.get_description(compression_mode)
+            simplified_schema = _simplify_schema_for_llm(tool.input_schema)
             
             result.append({
                 "type": "function",
                 "function": {
                     "name": tool.name,
                     "description": description,
-                    "parameters": tool.input_schema
+                    "parameters": simplified_schema
                 }
             })
         
