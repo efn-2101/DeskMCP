@@ -6,10 +6,10 @@
     "api_key": "optional_key_here"
   },
   "context_management": {
-    "hard_limit_tokens": 8192,
-    "soft_limit_tokens": 6000,
-    "tool_definition_budget_tokens": 4000,
-    "message_history_budget_tokens": 2000,
+    "hard_limit_tokens": 32000,
+    "soft_limit_tokens": 24000,
+    "tool_definition_budget_tokens": 8000,
+    "message_history_budget_tokens": 8000,
     "tool_result_pruning": {
       "read_max_chars": 4000,
       "write_max_chars": 2000,

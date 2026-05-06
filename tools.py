@@ -698,7 +698,7 @@ class ToolDescriptionCompressor:
         - 【他のツールとの使い分け】の最初の1行を追加
         - 上限を500文字に引き上げ
         """
-        MAX_COMPACT_CHARS = 500
+        MAX_COMPACT_CHARS = 1000
         
         sections = cls._extract_sections(description)
         
@@ -1196,7 +1196,7 @@ class ToolFilter:
         self,
         user_input: str,
         all_tools: List[ToolSchema],
-        max_tools: int = 15,
+        max_tools: int = 30,
         always_include: List[str] = None,
         server_quota: int = None,
         enable_server_boost: bool = True,

@@ -447,11 +447,48 @@ async def on_chat_resume(thread: dict):
         # 4. 履歴の復元とAgentへの記憶装填
         steps = await cl_data._data_layer.get_steps(thread.get("id"))
         restored_messages = []
-        for step in steps:
-            role = "user" if step["type"] == "user_message" else "assistant"
-            restored_messages.append({"role": role, "content": step.get("output", "")})
         
-        agent.history.messages = restored_messages
+        # ツール呼び出しとツール結果のペアを追跡するための辞書
+        pending_tool_calls = {}  # tool_call_id -> tool_call_info
+        
+        for step in steps:
+            step_type = step.get("type", "")
+            step_name = step.get("name", "")
+            step_output = step.get("output", "")
+            
+            if step_type == "user_message":
+                restored_messages.append({"role": "user", "content": step_output})
+            elif step_type == "assistant_message":
+                restored_messages.append({"role": "assistant", "content": step_output})
+            elif step_type == "tool":
+                # ツール実行ステップの処理
+                # Chainlitのステップ名からツール名を抽出（"🛠️ tool_name"形式）
+                tool_name = step_name.replace("🛠️ ", "").strip() if step_name else ""
+                
+                # ツール結果メッセージを追加
+                # tool_call_id は復元できないため、プレースホルダーを使用
+                tool_call_id = f"resume_{len(restored_messages)}"
+                restored_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": tool_name,
+                    "content": step_output
+                })
+            elif step_name == "推論":
+                # 推論ステップはスキップ（UI表示用のみ）
+                pass
+            elif step_name == "応答":
+                # 応答ステップはassistantメッセージとして復元（まだ追加されていない場合）
+                if step_output and (not restored_messages or restored_messages[-1].get("role") != "assistant"):
+                    restored_messages.append({"role": "assistant", "content": step_output})
+        
+        # システムプロンプトを保持しつつ、復元したメッセージを設定
+        if agent.history.messages and agent.history.messages[0].get("role") == "system":
+            system_msg = agent.history.messages[0]
+            agent.history.messages = [system_msg] + restored_messages
+        else:
+            agent.history.messages = restored_messages
+        
         logger.info(f"履歴復元完了: {len(restored_messages)}件のメッセージ")
         
         # ChatSettings（歯車メニュー）を初期化

@@ -90,13 +90,15 @@ def _get_default_config() -> dict:
             "provider": "ollama",
             "base_url": "http://localhost:11434/v1",
             "model_name": "gemma3:latest",
-            "api_key": "optional_key_here"
+            "api_key": "optional_key_here",
+            "temperature": 0.2,
+            "max_tokens": 4096
         },
         "context_management": {
-            "hard_limit_tokens": 8192,
-            "soft_limit_tokens": 6000,
-            "tool_definition_budget_tokens": 4000,
-            "message_history_budget_tokens": 2000
+            "hard_limit_tokens": 32000,
+            "soft_limit_tokens": 24000,
+            "tool_definition_budget_tokens": 8000,
+            "message_history_budget_tokens": 8000
         },
         "agent_safeguards": {
             "max_repeated_loops": 3,
@@ -198,6 +200,26 @@ def should_bypass_proxy(hostname: str) -> bool:
 # ============================================
 ENHANCED_SYSTEM_PROMPT_TEMPLATE = """
 あなたは親切で有能なAIアシスタントです。ユーザーの質問に丁寧かつ正確に回答してください。
+
+## 行動規範
+
+1. **応答フォーマット**:
+   - コードや設定値は必ずMarkdownのコードブロック（```）で囲んでください
+   - 表形式のデータはMarkdownテーブルを使用してください
+   - 箇条書きは `- ` または `1. ` を使用してください
+   - 重要な注意事項は **太字** で強調してください
+
+2. **ツール使用の原則**:
+   - ユーザーの意図を正確に理解してからツールを選択してください
+   - 複数のツールを順次実行する必要がある場合は、1つずつ順番に呼び出してください
+   - ツール呼び出しの引数は必須パラメータをすべて含めてください
+   - ツール実行結果に基づいて、ユーザーに分かりやすく要約して報告してください
+   - ツールが見つからない場合やエラーが発生した場合は、エラーの内容を説明し、代替案を提案してください
+
+3. **推論と回答**:
+   - 推論過程をユーザーに見せる必要はありません。結論と根拠を簡潔に述べてください
+   - 不確かな情報は「確信が持てません」と正直に伝えてください
+   - ユーザーの質問に直接関係ない情報は省略してください
 
 ## ツール使用ガイドライン
 
@@ -384,10 +406,10 @@ class AgentConfig:
     tool_execution_timeout_seconds: int = 60
     
     # コンテキスト管理設定
-    hard_limit_tokens: int = 8192
-    soft_limit_tokens: int = 6000
-    tool_definition_budget_tokens: int = 4000
-    message_history_budget_tokens: int = 2000
+    hard_limit_tokens: int = 32000
+    soft_limit_tokens: int = 24000
+    tool_definition_budget_tokens: int = 8000
+    message_history_budget_tokens: int = 8000
     
     # ツール結果Pruning設定
     tool_result_read_max_chars: int = 4000
@@ -400,6 +422,8 @@ class AgentConfig:
     base_url: str = "http://localhost:11434/v1"
     model_name: str = "gemma3:latest"
     api_key: str = "optional_key_here"
+    temperature: float = 0.2
+    max_tokens: int = 4096
     
     # システムプロンプト設定
     system_prompt: str = "あなたは親切で有能なAIアシスタントです。"
@@ -408,7 +432,7 @@ class AgentConfig:
     
     # ツールフィルタ設定
     tool_filter_enabled: bool = True
-    max_tools: int = 15
+    max_tools: int = 30
     always_include: list = field(default_factory=lambda: ["get_server_info"])
     compression_mode: str = "compact"  # full, compact, minimal
     
@@ -430,10 +454,10 @@ class AgentConfig:
             inference_timeout_seconds=safeguards.get("inference_timeout_seconds", 180),
             tool_execution_timeout_seconds=safeguards.get("tool_execution_timeout_seconds", 60),
             # コンテキスト管理
-            hard_limit_tokens=context_mgmt.get("hard_limit_tokens", 8192),
-            soft_limit_tokens=context_mgmt.get("soft_limit_tokens", 6000),
-            tool_definition_budget_tokens=context_mgmt.get("tool_definition_budget_tokens", 4000),
-            message_history_budget_tokens=context_mgmt.get("message_history_budget_tokens", 2000),
+            hard_limit_tokens=context_mgmt.get("hard_limit_tokens", 32000),
+            soft_limit_tokens=context_mgmt.get("soft_limit_tokens", 24000),
+            tool_definition_budget_tokens=context_mgmt.get("tool_definition_budget_tokens", 8000),
+            message_history_budget_tokens=context_mgmt.get("message_history_budget_tokens", 8000),
             # ツール結果Pruning設定
             tool_result_read_max_chars=tool_pruning.get("read_max_chars", 4000),
             tool_result_write_max_chars=tool_pruning.get("write_max_chars", 2000),
@@ -444,13 +468,15 @@ class AgentConfig:
             base_url=llm_settings.get("base_url", "http://localhost:11434/v1"),
             model_name=llm_settings.get("model_name", "gemma3:latest"),
             api_key=llm_settings.get("api_key", "optional_key_here"),
+            temperature=llm_settings.get("temperature", 0.2),
+            max_tokens=llm_settings.get("max_tokens", 4096),
             # システムプロンプト
             system_prompt=config.get("system_prompt", "あなたは親切で有能なAIアシスタントです。"),
             use_enhanced_prompt=prompt_settings.get("use_enhanced_prompt", True),
             include_tool_guidelines=prompt_settings.get("include_tool_guidelines", True),
             # ツールフィルタ
             tool_filter_enabled=tool_filter.get("enabled", True),
-            max_tools=tool_filter.get("max_tools", 15),
+            max_tools=tool_filter.get("max_tools", 30),
             always_include=tool_filter.get("always_include", ["get_server_info"]),
             compression_mode=tool_filter.get("compression_mode", "compact")
         )
@@ -564,6 +590,7 @@ class MessageHistory:
         
         self.messages.append({
             "role": "assistant",
+            "content": None,
             "tool_calls": openai_tool_calls
         })
         logger.debug(f"ツール呼び出しメッセージ追加: {len(tool_calls)}件")
@@ -591,6 +618,7 @@ class MessageHistory:
         self.messages.append({
             "role": "tool",
             "tool_call_id": tool_call_id,
+            "name": tool_name,
             "content": pruned_content
         })
         logger.debug(f"ツール結果追加: {tool_name} -> {pruned_content[:50]}...")
@@ -681,63 +709,88 @@ class MessageHistory:
         return self._trim_to_budget()
     
     def _estimate_total_tokens(self) -> int:
-        """メッセージ履歴の総トークン数を推定"""
+        """メッセージ履歴の総トークン数を推定（日本語対応）"""
         total = 0
         for msg in self.messages:
             content = msg.get("content", "")
             if isinstance(content, str):
-                total += len(content) / 3
+                total += self._estimate_text_tokens(content)
             elif isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "text":
-                        total += len(item.get("text", "")) / 3
+                        total += self._estimate_text_tokens(item.get("text", ""))
             
             # tool_callsのトークン数も推定
             tool_calls = msg.get("tool_calls", [])
             for tc in tool_calls:
                 func = tc.get("function", {})
-                total += len(func.get("name", "")) / 3
-                total += len(func.get("arguments", "")) / 3
+                total += self._estimate_text_tokens(func.get("name", ""))
+                total += self._estimate_text_tokens(func.get("arguments", ""))
         
         return int(total)
     
     def _estimate_messages_tokens(self, messages: list) -> int:
-        """メッセージリストのトークン数を推定"""
+        """メッセージリストのトークン数を推定（日本語対応）"""
         total = 0
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
-                total += len(content) / 3
+                total += self._estimate_text_tokens(content)
             tool_calls = msg.get("tool_calls", [])
             for tc in tool_calls:
                 func = tc.get("function", {})
-                total += len(func.get("name", "")) / 3
-                total += len(func.get("arguments", "")) / 3
+                total += self._estimate_text_tokens(func.get("name", ""))
+                total += self._estimate_text_tokens(func.get("arguments", ""))
         return int(total)
+    
+    @staticmethod
+    def _estimate_text_tokens(text: str) -> float:
+        """
+        テキストのトークン数を推定
+        
+        日本語: 約1.5文字/トークン（一般的な日本語トークナイザーの平均）
+        英語: 約4文字/トークン
+        混合テキスト: 文字種に応じて重み付け
+        """
+        if not text:
+            return 0.0
+        
+        # 日本語文字（CJK統合漢字、ひらがな、カタカナ等）をカウント
+        import re
+        japanese_chars = len(re.findall(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\u3400-\u4DBF\u3000-\u303F]', text))
+        other_chars = len(text) - japanese_chars
+        
+        # 日本語部分は1.5文字/トークン、それ以外は4文字/トークン
+        return (japanese_chars / 1.5) + (other_chars / 4.0)
     
     def _summarize_message(self, msg: dict) -> dict | None:
         """
         メッセージを要約版に変換
         
-        - tool メッセージ: 先頭300文字に切り詰め
-        - assistant メッセージ: 先頭200文字に切り詰め
-        - user メッセージ: 先頭200文字に切り詰め
+        - tool メッセージ: 先頭500文字に切り詰め
+        - assistant メッセージ: 先頭400文字に切り詰め
+        - user メッセージ: 先頭400文字に切り詰め
+        - tool_calls を含む assistant メッセージ: 要約しない（構造を保持）
         """
         role = msg.get("role", "")
         content = msg.get("content", "")
+        
+        # tool_calls を含む assistant メッセージは要約しない（構造保持）
+        if role == "assistant" and msg.get("tool_calls"):
+            return None
         
         if not isinstance(content, str):
             return None
         
         if role == "tool":
-            if len(content) > 300:
-                return {**msg, "content": content[:300] + "\n... [要約]"}
+            if len(content) > 500:
+                return {**msg, "content": content[:500] + "\n... [要約]"}
         elif role == "assistant":
-            if len(content) > 200:
-                return {**msg, "content": content[:200] + "\n... [要約]"}
+            if len(content) > 400:
+                return {**msg, "content": content[:400] + "\n... [要約]"}
         elif role == "user":
-            if len(content) > 200:
-                return {**msg, "content": content[:200] + "\n... [要約]"}
+            if len(content) > 400:
+                return {**msg, "content": content[:400] + "\n... [要約]"}
         
         return None
     
@@ -900,8 +953,15 @@ class Agent:
         
         # 初期システムプロンプトを構築（後で動的に更新）
         current_time = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
-        initial_prompt = f"""あなたは親切で有能なAIアシスタントです。
-ユーザーの質問に丁寧かつ正確に回答してください。
+        initial_prompt = f"""あなたは親切で有能なAIアシスタントです。ユーザーの質問に丁寧かつ正確に回答してください。
+
+## 行動規範
+1. コードや設定値は必ずMarkdownのコードブロック（```）で囲んでください
+2. 表形式のデータはMarkdownテーブルを使用してください
+3. ツールを使用する場合は必須パラメータをすべて含めてください
+4. ツール実行結果に基づいて、ユーザーに分かりやすく要約して報告してください
+5. 推論過程をユーザーに見せる必要はありません。結論と根拠を簡潔に述べてください
+6. 不確かな情報は「確信が持てません」と正直に伝えてください
 
 ## 現在のシステム時刻
 {current_time}
@@ -1065,16 +1125,15 @@ class Agent:
                         approved, rejection_msg = await self._request_tool_approval(tool_call)
                         
                         if not approved:
-                            # 【重要】拒否された場合：強制終了フラグを設定し、ループを抜ける
-                            # LLMが代替手段を模索して勝手に実行することを防ぐ
-                            self._rejection_occurred = True
+                            # 拒否された場合：ツール結果としてエラーを記録し、次の推論へ
+                            # LLMに拒否されたことを伝え、代替案を提案させる
                             self.history.add_tool_result(
                                 tool_call_id=tool_call.id,
                                 tool_name=tool_call.name,
-                                raw_result={"rejected": True},
+                                raw_result={"rejected": True, "error": rejection_msg},
                                 summary=rejection_msg
                             )
-                            # ただちにツール実行ループを抜け、メインループも終了
+                            # ツール実行ループを抜け、次の推論でLLMが対応を決定
                             break  # for tool_call in tool_calls ループを抜ける
                     
                     async with cl.Step(name=f"🛠️ {tool_call.name}") as tool_step:
@@ -1123,7 +1182,7 @@ class Agent:
                 
                 # ツール実行後、LLMがcontentを同時に返していた場合はループ終了
                 # （LLMが「このツール実行が最後」として報告を含めて返すケース）
-                if llm_response.content and not self._rejection_occurred:
+                if llm_response.content:
                     logger.info(f"[診断] ツール実行後のcontent応答を検知、ループ終了: {llm_response.content[:100]}...")
                     self.history.add_assistant_message(llm_response.content)
                     async with cl.Step(name="応答") as response_step:
@@ -1185,8 +1244,8 @@ class Agent:
         request_body = {
             "model": self.config.model_name,
             "messages": self.history.get_context_for_llm(),
-            "temperature": 0.7,
-            "max_tokens": 4096
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens
         }
         
         # ツールが存在する場合は追加
@@ -1524,8 +1583,8 @@ class Agent:
             v for k, v in self._tool_call_counter.items()
             if k.startswith("_name:")
         )
-        # 1セッション中のツール呼び出し総数が max_repeated_loops * 3 を超えたら検知
-        total_threshold = self.config.max_repeated_loops * 3
+        # 1セッション中のツール呼び出し総数が max_repeated_loops * 5 を超えたら検知
+        total_threshold = self.config.max_repeated_loops * 5
         if total_calls > total_threshold:
             logger.warning(f"ループ検知（総数）: ツール呼び出し総数 {total_calls} が閾値 {total_threshold} を超過")
             return True
