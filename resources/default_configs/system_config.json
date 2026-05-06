@@ -3,7 +3,9 @@
     "provider": "ollama",
     "base_url": "http://localhost:11434/v1",
     "model_name": "qwen3.5:9b",
-    "api_key": "optional_key_here"
+    "api_key": "optional_key_here",
+    "temperature": 0.2,
+    "max_tokens": 16384
   },
   "context_management": {
     "hard_limit_tokens": 32000,

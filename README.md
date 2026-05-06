@@ -35,13 +35,13 @@ python app.py
 - **自律型エージェントループ** — ユーザーの指示を受けると、LLM が推論→ツール実行判定→ツール実行→履歴更新→再推論を最大10回まで自動反復し、タスクを完遂します
 - **MCP プロトコル統合** — Stdio / SSE 両トランスポートに対応し、複数の MCP サーバーからツールを動的に取得・実行します
 - **OpenAI 互換 API 対応** — Ollama / vLLM / LM Studio など、OpenAI 互換の推論エンドポイントを利用可能（デフォルト: Ollama `localhost:11434`）
-- **小規模LLM対応** — ツールフィルタリング・説明圧縮・強化版システムプロンプトにより、7B〜9B程度の小規模モデルでもツールを適切に認識・使い分け可能（詳細は「⚙️ 設定方法」を参照）
+- **小規模LLM対応** — ツールフィルタリング・説明圧縮・強化版システムプロンプトにより、4B〜9B程度の小規模モデルでもツールを適切に認識・使い分け可能（詳細は「⚙️ 設定方法」を参照）
 - **ツール実行承認システム** — `create_` / `update_` / `delete_` 等の危険操作はユーザーの承認が必要。`get_` / `list_` / `check_` 等の安全な操作は自動実行されます
-- **コンテキスト剪定（Pruning）** — ツールの大量出力を先頭保持＋省略表示で要約し、コンテキスト上限に収めます。参照系4000文字／更新系2000文字／情報系1000文字のカテゴリ別上限で、長大なツール結果を適切に圧縮します（デフォルト: ハードリミット8192トークン / ソフトリミット6000トークン）
+- **コンテキスト剪定（Pruning）** — ツールの大量出力を先頭保持＋省略表示で要約し、コンテキスト上限に収めます。参照系4000文字／更新系2000文字／情報系1000文字のカテゴリ別上限で、長大なツール結果を適切に圧縮します（デフォルト: ハードリミット32000トークン / ソフトリミット24000トークン）
 - **ループ検出** — 3段階（完全一致・ツール名一致・総呼び出し回数）で無限ループを検出し、エージェントの暴走を防ぎます
 - **アクションボタン / マクロ** — 設定ファイルで定義したボタンをチャット UI に表示し、ワンクリックで所定のプロンプトとペルソナを注入できます
 - **チャット履歴の永続化** — SQLite（WALモード）によりスレッド・ステップ単位で会話履歴を保存し、セッション再開が可能です
-- **DeskToDo MCP サーバー同梱** — タスク管理に特化した MCP サーバーを標準搭載。FTS5 全文検索・エンベディング意味検索・一括操作・変更履歴追跡など34以上のツールを提供します
+- **DeskToDo MCP サーバー同梱** — タスク管理に特化した MCP サーバーを標準搭載。FTS5 全文検索・エンベディング意味検索・一括操作・変更履歴追跡など30以上のツールを提供します
 
 ## 📋 必要要件
 
@@ -79,6 +79,8 @@ pip install -r requirements.txt
 | `mcp` | >=1.0.0 | MCP プロトコルクライアント |
 | `anyio` | >=3.7.0 | 非同期ユーティリティ |
 | `aiosqlite` | >=0.19.0 | SQLite 非同期アクセス |
+| `python-dotenv` | >=1.0.0 | 環境変数読み込み |
+| `pyyaml` | >=6.0 | DeskToDo MCPサーバーのYAML設定ファイル対応 |
 
 ### DeskToDo MCP サーバーの依存インストール
 
@@ -249,13 +251,15 @@ LLM、コンテキスト管理、ツールフィルタリングなどのシス�
     "provider": "ollama",
     "base_url": "http://localhost:11434/v1",
     "model_name": "qwen3.5:9b",
-    "api_key": "optional_key_here"
+    "api_key": "optional_key_here",
+    "temperature": 0.2,
+    "max_tokens": 16384
   },
   "context_management": {
-    "hard_limit_tokens": 8192,
-    "soft_limit_tokens": 6000,
-    "tool_definition_budget_tokens": 4000,
-    "message_history_budget_tokens": 2000,
+    "hard_limit_tokens": 32000,
+    "soft_limit_tokens": 24000,
+    "tool_definition_budget_tokens": 8000,
+    "message_history_budget_tokens": 8000,
     "tool_result_pruning": {
       "read_max_chars": 4000,
       "write_max_chars": 2000,
@@ -296,7 +300,12 @@ LLM、コンテキスト管理、ツールフィルタリングなどのシス�
 |---|---|
 | `llm_settings.base_url` | OpenAI 互換 API のベース URL |
 | `llm_settings.model_name` | 使用するモデル名 |
+| `llm_settings.temperature` | サンプリング温度（0.0〜1.0、低いほど決定的） |
+| `llm_settings.max_tokens` | 1回の推論で生成する最大トークン数 |
 | `context_management.hard_limit_tokens` | コンテキストのハードリミット（トークン数） |
+| `context_management.soft_limit_tokens` | コンテキストのソフトリミット（トークン数） |
+| `context_management.tool_definition_budget_tokens` | ツール定義に割り当てるトークン予算 |
+| `context_management.message_history_budget_tokens` | メッセージ履歴に割り当てるトークン予算 |
 | `context_management.tool_result_pruning` | ツール結果の剪定設定（参照系/更新系/情報系の文字数上限） |
 | `tool_filter_settings.max_tools` | 最大ツール数（小規模LLMは10〜20推奨） |
 | `tool_filter_settings.compression_mode` | ツール説明の圧縮モード（`compact` / `minimal` / `full`）。デフォルトは `full`（32K+モデルでは自動的に圧縮なし） |
@@ -307,10 +316,12 @@ LLM、コンテキスト管理、ツールフィルタリングなどのシス�
 
 ```json
 {
-  "llm_settings": { "model_name": "qwen3.5:4b" },
+  "llm_settings": { "model_name": "gemma3:4b" },
   "context_management": {
     "hard_limit_tokens": 4096,
-    "soft_limit_tokens": 3000
+    "soft_limit_tokens": 3000,
+    "tool_definition_budget_tokens": 4000,
+    "message_history_budget_tokens": 2000
   },
   "tool_filter_settings": {
     "enabled": true,
@@ -454,6 +465,17 @@ MCPサーバーの接続設定を定義します。Stdio トランスポート�
 
 チャット UI に表示するボタンを定義します。
 
+**フィールドの説明:**
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `id` | string | ○ | ボタンの一意な識別子 |
+| `ui_label` | string | ○ | UIに表示するラベル（絵文字可） |
+| `ui_description` | string | | ボタンのホバー時に表示する説明文 |
+| `agent_persona` | string | | エージェントのペルソナ（`secretary`等、UI表示用） |
+| `task_instruction` | string | ○ | ボタン押下時に注入されるプロンプト |
+| `mcp_server` | string | | 使用するMCPサーバー名（未設定時は全サーバーのツールを使用） |
+
 ```json
 {
   "action_buttons": [
@@ -546,7 +568,7 @@ DeskToDo は本プロジェクトに同梱されるタスク管理特化型 MCP 
 - **変更履歴** — タスクごとの変更履歴を全て記録・参照可能
 - **文書ファイル読み込み** — `.eml` / `.msg` / `.txt` / `.md` / `.csv` ファイルをパースしてテキスト抽出
 
-### 提供ツール一覧（34ツール）
+### 提供ツール一覧（30以上のツール）
 
 **タスク操作（13ツール）**
 
@@ -660,6 +682,7 @@ DeskMCP/
 ├── data/                           # チャット履歴 DB
 ├── config/                         # ユーザー設定（gitignore 対象）
 ├── resources/default_configs/      # デフォルト設定ファイル
+├── docs/                           # ドキュメント
 └── default_mcp_server/DeskToDo/    # DeskToDo MCP サーバー
 ```
 
