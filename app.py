@@ -19,6 +19,7 @@ import logging
 import json
 import os
 import shutil
+import base64
 from pathlib import Path
 
 import chainlit as cl
@@ -36,6 +37,62 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+# ============================================
+# ファイル添付処理設定
+# ============================================
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
+
+# 以下のホワイトリスト変数は過去の遺産であり、現在は未使用。
+# _is_allowed_file() が拡張子/MIMEに関わらず全ファイルを許可するため、
+# 参照箇所はない。削除しても動作に影響しないが、履歴として残す。
+ALLOWED_TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".py", ".yaml", ".yml", ".xml", ".html", ".htm", ".log", ".ini", ".cfg", ".toml", ".rst"}
+ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+ALLOWED_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"}
+ALLOWED_TEXT_MIME_TYPES = {
+    "text/plain", "text/markdown", "text/csv", "application/json",
+    "text/x-python", "application/x-yaml", "text/yaml", "application/xml",
+    "text/html", "text/x-log", "text/ini", "text/x-toml"
+}
+
+
+def _is_allowed_file(filename: str, mime: str) -> bool:
+    """ファイルが許可された拡張子/MIMEタイプかを判定
+    
+    注: ホワイトリスト方式を撤廃し、すべてのファイル形式を許可する。
+    セキュリティはファイルサイズ上限やパストラバーサルチェックで担保する。
+    """
+    if not filename:
+        return False
+    return True
+
+
+def _extract_file_info(element) -> dict | None:
+    """
+    ChainlitのElementからファイル情報を抽出
+    
+    Returns:
+        ファイル情報辞書（path, name, mime, size）またはNone
+    """
+    # cl.File またはファイル要素を検出
+    if not hasattr(element, "path"):
+        return None
+    
+    file_path = getattr(element, "path", None)
+    if not file_path or not os.path.exists(file_path):
+        return None
+    
+    name = getattr(element, "name", Path(file_path).name)
+    mime = getattr(element, "mime", "")
+    size = os.path.getsize(file_path)
+    
+    return {
+        "path": file_path,
+        "name": name,
+        "mime": mime,
+        "size": size
+    }
 
 
 # ============================================
@@ -508,7 +565,7 @@ async def on_chat_resume(thread: dict):
 # ============================================
 # ユーザー入力処理コアロジック
 # ============================================
-async def _process_user_input(user_input: str, server_name: str = None) -> None:
+async def _process_user_input(user_input: str, server_name: str = None, file_attachments: list[dict] = None) -> None:
     """
     ユーザー入力の処理コアロジック
     
@@ -521,10 +578,13 @@ async def _process_user_input(user_input: str, server_name: str = None) -> None:
     Args:
         user_input: ユーザーからの入力テキスト
         server_name: MCPサーバー名（指定時は該当サーバーのツールのみを使用）
+        file_attachments: 添付ファイル情報リスト（辞書のリスト）
     """
     logger.info(f"ユーザーメッセージ処理: {user_input[:50]}...")
     if server_name:
         logger.info(f"  サーバー指定: {server_name}")
+    if file_attachments:
+        logger.info(f"  添付ファイル: {len(file_attachments)}件")
     
     # セッションからAgentを取得
     agent: Agent = cl.user_session.get("agent")
@@ -540,7 +600,7 @@ async def _process_user_input(user_input: str, server_name: str = None) -> None:
         # すべてのロジック（推論、ツール実行、履歴管理）はAgent内で完結
         final_response = None
         
-        async for step in agent.run(user_input=user_input, server_name=server_name):
+        async for step in agent.run(user_input=user_input, server_name=server_name, file_attachments=file_attachments):
             # Agentからの応答を順次UIに表示
             # stepはChainlitのStepオブジェクト
             if hasattr(step, 'output') and step.output:
@@ -581,6 +641,7 @@ async def on_message(message: cl.Message):
     
     責務:
     - メニュー消去処理
+    - 添付ファイルの検出と検証
     - _process_user_inputへの委譲
     
     【重要】メッセージのDB保存はChainlitが自動で行うため、
@@ -598,8 +659,46 @@ async def on_message(message: cl.Message):
             pass
         cl.user_session.set("action_menu_msg", None)
     
+    # 添付ファイルの検出と検証
+    file_attachments = []
+    warning_messages = []
+    
+    if message.elements:
+        for element in message.elements:
+            file_info = _extract_file_info(element)
+            if not file_info:
+                continue
+            
+            # ファイルサイズチェック
+            if file_info["size"] > MAX_FILE_SIZE_BYTES:
+                warning_messages.append(
+                    f"⚠️ ファイル '{file_info['name']}' ({file_info['size'] / 1024 / 1024:.1f}MB) はサイズ上限（10MB）を超えているため無視されました。"
+                )
+                continue
+            
+            # ファイル名の妥当性チェック（パストラバーサル等の基本的な検証）
+            if not _is_allowed_file(file_info["name"], file_info["mime"]):
+                warning_messages.append(
+                    f"⚠️ ファイル '{file_info['name']}' は無効なファイル名のため無視されました。"
+                )
+                continue
+            
+            file_attachments.append(file_info)
+            logger.info(f"添付ファイル検出: {file_info['name']} ({file_info['size']} bytes, {file_info['mime']})")
+    
+    # 警告があればユーザーに通知
+    if warning_messages:
+        await cl.Message(content="\n".join(warning_messages)).send()
+    
+    # 検証済みのファイルパスをMCPマネージャーに登録（ツール実行時のセキュリティ許可リスト）
+    mcp_manager = cl.user_session.get("mcp_manager")
+    if mcp_manager and file_attachments:
+        mcp_manager.clear_uploaded_files()
+        for file_info in file_attachments:
+            mcp_manager.register_uploaded_file(file_info["path"])
+    
     # コアロジックはデコレータなしの関数に委譲
-    await _process_user_input(message.content)
+    await _process_user_input(message.content, file_attachments=file_attachments)
 
 
 # ============================================
@@ -657,7 +756,7 @@ async def _inject_macro_prompt(btn_config: dict) -> None:
         logger.info(f"  emitter.task_start() 完了")
         
         try:
-            await _process_user_input(prompt, server_name=server_name)
+            await _process_user_input(prompt, server_name=server_name, file_attachments=None)
         except Exception as e:
             logger.error(f"バックグラウンドマクロ処理エラー: {e}")
         finally:

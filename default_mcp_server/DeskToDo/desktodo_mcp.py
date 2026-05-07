@@ -10,6 +10,7 @@ Roo Code、Cline、Cursor、その他あらゆるMCP互換クライアントか�
 import sqlite3
 import os
 import logging
+import base64
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional, Dict, Any, List
@@ -902,7 +903,7 @@ def validate_filepath(filepath: str) -> str:
     return filepath
 
 
-def parse_eml_file(filepath: str) -> str:
+def parse_eml_file(filepath: str = None, file_bytes: bytes = None) -> str:
     """
     標準メールファイル（.eml）をパースする。
     
@@ -911,7 +912,8 @@ def parse_eml_file(filepath: str) -> str:
     HTMLタグやBase64エンコードされた添付ファイルは除外する。
     
     Args:
-        filepath: .emlファイルのパス
+        filepath: .emlファイルのパス（file_bytesが指定されない場合に使用）
+        file_bytes: ファイルのバイト列（優先）
     
     Returns:
         str: フォーマット済みのメール内容
@@ -923,8 +925,12 @@ def parse_eml_file(filepath: str) -> str:
     logger = get_logger()
     
     try:
-        with open(filepath, 'rb') as f:
-            msg = BytesParser(policy=policy.default).parse(f)
+        if file_bytes is not None:
+            from io import BytesIO
+            msg = BytesParser(policy=policy.default).parse(BytesIO(file_bytes))
+        else:
+            with open(filepath, 'rb') as f:
+                msg = BytesParser(policy=policy.default).parse(f)
         
         # ヘッダー情報の抽出
         subject = msg.get('Subject', '(件名なし)')
@@ -1005,7 +1011,7 @@ def parse_eml_file(filepath: str) -> str:
         return f"メールファイルの読み込みに失敗しました: {str(e)}"
 
 
-def parse_msg_file(filepath: str) -> str:
+def parse_msg_file(filepath: str = None, file_bytes: bytes = None) -> str:
     """
     Outlook専用メールファイル（.msg）をパースする。
     
@@ -1013,7 +1019,8 @@ def parse_msg_file(filepath: str) -> str:
     ライブラリが存在しない場合はガイダンス文字列を返す。
     
     Args:
-        filepath: .msgファイルのパス
+        filepath: .msgファイルのパス（file_bytesが指定されない場合に使用）
+        file_bytes: ファイルのバイト列（優先）
     
     Returns:
         str: フォーマット済みのメール内容、またはエラーメッセージ
@@ -1025,9 +1032,31 @@ def parse_msg_file(filepath: str) -> str:
     except ImportError:
         return "`.msg` ファイルを読むには `pip install extract-msg` が必要です"
     
+    temp_path = None
     try:
-        # ExtractMsgでメールを開く
-        msg = extract_msg.openMsg(filepath)
+        if file_bytes is not None:
+            # 許可ディレクトリ内に一時ファイルを作成
+            import tempfile
+            allowed_dirs_env = os.environ.get('DESKTODO_ALLOWED_DIRS', '')
+            if allowed_dirs_env:
+                allowed_dirs = [d.strip() for d in allowed_dirs_env.split(',') if d.strip()]
+            else:
+                allowed_dirs = [os.getcwd(), os.path.expanduser('~')]
+            
+            temp_dir = allowed_dirs[0] if allowed_dirs else tempfile.gettempdir()
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            fd, temp_path = tempfile.mkstemp(suffix='.msg', dir=temp_dir)
+            try:
+                os.write(fd, file_bytes)
+            finally:
+                os.close(fd)
+            
+            # ExtractMsgでメールを開く
+            msg = extract_msg.openMsg(temp_path)
+        else:
+            # ExtractMsgでメールを開く
+            msg = extract_msg.openMsg(filepath)
         
         # ヘッダー情報の抽出
         subject = msg.subject or '(件名なし)'
@@ -1054,7 +1083,7 @@ def parse_msg_file(filepath: str) -> str:
         return f"Outlookメールファイルの読み込みに失敗しました: {str(e)}"
 
 
-def parse_text_file(filepath: str) -> str:
+def parse_text_file(filepath: str = None, file_bytes: bytes = None) -> str:
     """
     一般テキストファイルをパースする。
     
@@ -1063,7 +1092,8 @@ def parse_text_file(filepath: str) -> str:
     ファイルサイズ制限（環境変数 DESKTODO_MAX_FILE_SIZE_MB、デフォルト10MB）を適用。
     
     Args:
-        filepath: テキストファイルのパス
+        filepath: テキストファイルのパス（file_bytesが指定されない場合に使用）
+        file_bytes: ファイルのバイト列（優先）
     
     Returns:
         str: ファイルの内容
@@ -1078,7 +1108,11 @@ def parse_text_file(filepath: str) -> str:
     max_size_bytes = max_size_mb * 1024 * 1024
     
     # ファイルサイズのチェック
-    file_size = os.path.getsize(filepath)
+    if file_bytes is not None:
+        file_size = len(file_bytes)
+    else:
+        file_size = os.path.getsize(filepath)
+    
     if file_size > max_size_bytes:
         raise ValueError(
             f"ファイルサイズが制限を超えています ({file_size / 1024 / 1024:.2f}MB > {max_size_mb}MB)"
@@ -1087,23 +1121,33 @@ def parse_text_file(filepath: str) -> str:
     # ファイルの読み込み
     encodings = ['utf-8', 'cp932', 'shift_jis', 'euc-jp', 'iso-2022-jp']
     
-    for encoding in encodings:
-        try:
-            with open(filepath, 'r', encoding=encoding) as f:
-                content = f.read()
-            logger.debug(f"ファイルを {encoding} エンコーディングで読み込みました: {filepath}")
-            return content
-        except UnicodeDecodeError:
-            continue
-        except Exception as e:
-            logger.error(f"ファイル読み込みエラー ({encoding}): {e}")
-            continue
-    
-    # すべてのエンコーディングで失敗した場合
-    raise ValueError(f"ファイルのエンコーディングを特定できませんでした: {filepath}")
+    if file_bytes is not None:
+        for encoding in encodings:
+            try:
+                content = file_bytes.decode(encoding)
+                logger.debug(f"バイト列を {encoding} エンコーディングでデコードしました")
+                return content
+            except UnicodeDecodeError:
+                continue
+        raise ValueError("バイト列のエンコーディングを特定できませんでした")
+    else:
+        for encoding in encodings:
+            try:
+                with open(filepath, 'r', encoding=encoding) as f:
+                    content = f.read()
+                logger.debug(f"ファイルを {encoding} エンコーディングで読み込みました: {filepath}")
+                return content
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                logger.error(f"ファイル読み込みエラー ({encoding}): {e}")
+                continue
+        
+        # すべてのエンコーディングで失敗した場合
+        raise ValueError(f"ファイルのエンコーディングを特定できませんでした: {filepath}")
 
 
-def read_document_file(filepath: str) -> str:
+def read_document_file(filepath: str = None, file_content_base64: str = None, filename: str = None) -> str:
     """
     指定されたファイルを読み込み、AIが解釈しやすい形式でテキストデータを返す。
     
@@ -1114,39 +1158,65 @@ def read_document_file(filepath: str) -> str:
     ユーザーから「このメールを読んで」と指示された際に最初に使用してください。
     
     対応拡張子: .eml, .msg, .txt, .md, .csv
+    その他の拡張子はテキストファイルとして読み込みを試行します。
     
     Args:
         filepath: 読み込むファイルのパス（絶対パスまたは相対パス）
+        file_content_base64: base64エンコードされたファイル内容（優先）
+        filename: ファイル名（file_content_base64使用時に拡張子判定に必要）
     
     Returns:
         str: パースされたテキスト内容
     
     Raises:
-        ValueError: パスが無効または許可されていない場合
+        ValueError: パスが無効または許可されていない場合、base64デコードエラー
         FileNotFoundError: ファイルが存在しない場合
     """
     logger = get_logger()
     
-    # パスの検証
-    validated_path = validate_filepath(filepath)
+    file_bytes = None
+    ext = None
     
-    # 拡張子の取得
-    _, ext = os.path.splitext(validated_path)
-    ext = ext.lower()
-    
-    logger.info(f"ファイルを読み込みます: {validated_path} (拡張子: {ext})")
+    if file_content_base64 is not None:
+        # base64デコード
+        try:
+            file_bytes = base64.b64decode(file_content_base64)
+        except Exception as e:
+            raise ValueError(f"base64デコードエラー: {e}")
+        
+        # 拡張子の取得
+        if filename:
+            _, ext = os.path.splitext(filename)
+        else:
+            ext = '.txt'  # デフォルト
+        ext = ext.lower()
+        
+        logger.info(f"base64エンコードされたファイルを読み込みます (拡張子: {ext}, サイズ: {len(file_bytes)} bytes)")
+    else:
+        # パスの検証
+        validated_path = validate_filepath(filepath)
+        
+        # 拡張子の取得
+        _, ext = os.path.splitext(validated_path)
+        ext = ext.lower()
+        
+        logger.info(f"ファイルを読み込みます: {validated_path} (拡張子: {ext})")
     
     # 拡張子に基づいてパーサーを選択
     if ext == '.eml':
-        return parse_eml_file(validated_path)
+        result = parse_eml_file(filepath=filepath if file_bytes is None else None, file_bytes=file_bytes)
+        return result
     elif ext == '.msg':
-        return parse_msg_file(validated_path)
+        result = parse_msg_file(filepath=filepath if file_bytes is None else None, file_bytes=file_bytes)
+        return result
     elif ext in ['.txt', '.md', '.csv']:
-        return parse_text_file(validated_path)
+        result = parse_text_file(filepath=filepath if file_bytes is None else None, file_bytes=file_bytes)
+        return result
     else:
         # 未対応の拡張子はテキストファイルとして読み込みを試行
         logger.warning(f"未対応の拡張子です: {ext}。テキストファイルとして読み込みを試行します。")
-        return parse_text_file(validated_path)
+        result = parse_text_file(filepath=filepath if file_bytes is None else None, file_bytes=file_bytes)
+        return result
 
 # ============================================================================
 # MCPツール関数群

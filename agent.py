@@ -14,6 +14,7 @@ import logging
 import os
 import shutil
 import ipaddress
+import base64
 from typing import AsyncGenerator, Optional, Any
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -538,18 +539,21 @@ class MessageHistory:
                 "content": system_prompt
             })
     
-    def add_user_message(self, content: str) -> None:
+    def add_user_message(self, content: str | list) -> None:
         """
         ユーザーメッセージを追加
         
         Args:
-            content: ユーザー入力テキスト
+            content: ユーザー入力テキスト、またはマルチモーダルcontentリスト
         """
         self.messages.append({
             "role": "user",
             "content": content
         })
-        logger.debug(f"ユーザーメッセージ追加: {content[:50]}...")
+        if isinstance(content, str):
+            logger.debug(f"ユーザーメッセージ追加: {content[:50]}...")
+        else:
+            logger.debug(f"ユーザーメッセージ追加（マルチモーダル）: {len(content)}要素")
     
     def add_assistant_message(self, content: str) -> None:
         """
@@ -719,6 +723,22 @@ class MessageHistory:
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "text":
                         total += self._estimate_text_tokens(item.get("text", ""))
+                    elif isinstance(item, dict) and item.get("type") == "image_url":
+                        # 画像のトークン数を推定（base64データサイズに基づく簡易推定）
+                        image_url = item.get("image_url", {})
+                        url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
+                        if url.startswith("data:"):
+                            # base64データ部分を抽出して推定
+                            try:
+                                b64_part = url.split(",")[-1]
+                                # base64文字数 -> バイト数 -> ピクセル数（概算）
+                                image_bytes = len(b64_part) * 3 // 4
+                                # 画像トークン: 約1000トークン/画像（簡易推定）
+                                total += 1000
+                            except Exception:
+                                total += 1000
+                        else:
+                            total += 1000
             
             # tool_callsのトークン数も推定
             tool_calls = msg.get("tool_calls", [])
@@ -736,6 +756,12 @@ class MessageHistory:
             content = msg.get("content", "")
             if isinstance(content, str):
                 total += self._estimate_text_tokens(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        total += self._estimate_text_tokens(item.get("text", ""))
+                    elif isinstance(item, dict) and item.get("type") == "image_url":
+                        total += 1000  # 画像トークン概算
             tool_calls = msg.get("tool_calls", [])
             for tc in tool_calls:
                 func = tc.get("function", {})
@@ -769,7 +795,7 @@ class MessageHistory:
         
         - tool メッセージ: 先頭500文字に切り詰め
         - assistant メッセージ: 先頭400文字に切り詰め
-        - user メッセージ: 先頭400文字に切り詰め
+        - user メッセージ: 先頭400文字に切り詰め（マルチモーダルは要約しない）
         - tool_calls を含む assistant メッセージ: 要約しない（構造を保持）
         """
         role = msg.get("role", "")
@@ -777,6 +803,10 @@ class MessageHistory:
         
         # tool_calls を含む assistant メッセージは要約しない（構造保持）
         if role == "assistant" and msg.get("tool_calls"):
+            return None
+        
+        # マルチモーダルcontent（リスト）は要約しない（構造を保持）
+        if isinstance(content, list):
             return None
         
         if not isinstance(content, str):
@@ -1022,7 +1052,7 @@ class Agent:
     # ============================================
     # メインループ
     # ============================================
-    async def run(self, user_input: str, server_name: str = None) -> AsyncGenerator[Any, None]:
+    async def run(self, user_input: str, server_name: str = None, file_attachments: list[dict] = None) -> AsyncGenerator[Any, None]:
         """
         自律エージェントのメインループ
         
@@ -1032,6 +1062,7 @@ class Agent:
         Args:
             user_input: ユーザーからの入力テキスト
             server_name: MCPサーバー名（指定時は該当サーバーのツールのみを使用）
+            file_attachments: 添付ファイル情報リスト（辞書のリスト）
             
         Yields:
             Chainlit Step/Message オブジェクト
@@ -1042,8 +1073,14 @@ class Agent:
         # 動的システムプロンプトが未生成の場合は生成
         await self._ensure_dynamic_prompt()
         
+        # 添付ファイルがあれば処理してマルチモーダルメッセージを構築
+        if file_attachments:
+            user_content = await self._build_multimodal_user_message(user_input, file_attachments)
+        else:
+            user_content = user_input
+        
         # ユーザー入力を履歴に追加
-        self.history.add_user_message(user_input)
+        self.history.add_user_message(user_content)
         self._cancel_requested = False
         self._tool_call_counter.clear()
         self._rejection_occurred = False  # 拒否フラグをリセット
@@ -1218,6 +1255,105 @@ class Agent:
     # ============================================
     # 内部メソッド（プライベート）
     # ============================================
+    async def _build_multimodal_user_message(self, user_input: str, file_attachments: list[dict]) -> list[dict]:
+        """
+        添付ファイルを含むマルチモーダルユーザーメッセージを構築
+        
+        Args:
+            user_input: ユーザー入力テキスト
+            file_attachments: 添付ファイル情報リスト
+            
+        Returns:
+            OpenAI互換マルチモーダルcontentリスト
+        """
+        content_parts = [{"type": "text", "text": user_input}]
+        
+        for file_info in file_attachments:
+            file_path = file_info.get("path", "")
+            file_name = file_info.get("name", "")
+            mime_type = file_info.get("mime", "")
+            
+            if not file_path or not os.path.exists(file_path):
+                logger.warning(f"ファイルが見つかりません: {file_path}")
+                content_parts.append({
+                    "type": "text",
+                    "text": f"[添付ファイル '{file_name}' が見つかりません]"
+                })
+                continue
+            
+            ext = Path(file_name).suffix.lower()
+            
+            try:
+                # 画像ファイル: base64エンコードしてマルチモーダル形式で追加
+                if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+                    with open(file_path, "rb") as f:
+                        image_data = f.read()
+                    
+                    # MIMEタイプの推定
+                    if not mime_type:
+                        mime_map = {
+                            ".png": "image/png",
+                            ".jpg": "image/jpeg",
+                            ".jpeg": "image/jpeg",
+                            ".gif": "image/gif",
+                            ".webp": "image/webp",
+                            ".bmp": "image/bmp"
+                        }
+                        mime_type = mime_map.get(ext, "image/png")
+                    
+                    b64_data = base64.b64encode(image_data).decode("utf-8")
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{b64_data}"
+                        }
+                    })
+                    logger.info(f"画像ファイルをbase64エンコード: {file_name} ({len(image_data)} bytes)")
+                
+                # テキストファイル: 内容を読み込んでテキストとして追加
+                elif ext in {".txt", ".md", ".csv", ".json", ".py", ".yaml", ".yml", ".xml", ".html", ".htm", ".log", ".ini", ".cfg", ".toml", ".rst"}:
+                    # エンコーディングを推定（UTF-8優先、失敗したらshift-jis）
+                    file_text = ""
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            file_text = f.read()
+                    except UnicodeDecodeError:
+                        try:
+                            with open(file_path, "r", encoding="shift_jis") as f:
+                                file_text = f.read()
+                        except UnicodeDecodeError:
+                            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                                file_text = f.read()
+                    
+                    # 長すぎる場合は切り詰め
+                    max_text_chars = 8000
+                    if len(file_text) > max_text_chars:
+                        file_text = file_text[:max_text_chars] + f"\n... [ファイル '{file_name}' の内容が長いため切り詰め: 全{len(file_text)}文字]"
+                    
+                    content_parts.append({
+                        "type": "text",
+                        "text": f"\n\n--- 添付ファイル: {file_name} ---\n{file_text}\n--- ファイル終了 ---\n"
+                    })
+                    logger.info(f"テキストファイルを読み込み: {file_name} ({len(file_text)} chars)")
+                
+                # その他のファイル: ファイルパスを含めてテキストとして追加
+                else:
+                    file_size = os.path.getsize(file_path)
+                    content_parts.append({
+                        "type": "text",
+                        "text": f"\n\n--- 添付ファイル: {file_name} ---\nファイルパス: {file_path}\n（read_document_file ツールで読み込んでください。）\n--- ファイル終了 ---\n"
+                    })
+                    logger.info(f"その他のファイル情報を追加: {file_name} ({file_size} bytes)")
+            
+            except Exception as e:
+                logger.error(f"ファイル読み込みエラー ({file_name}): {e}")
+                content_parts.append({
+                    "type": "text",
+                    "text": f"\n[添付ファイル '{file_name}' の読み込み中にエラーが発生しました: {str(e)}]\n"
+                })
+        
+        return content_parts
+    
     async def _call_llm(self, user_input: str = None) -> LLMResponse:
         """
         LLMへのAPI呼び出し
@@ -1241,9 +1377,14 @@ class Agent:
         )
         
         # リクエストボディを構築
+        messages = self.history.get_context_for_llm()
+        
+        # マルチモーダルメッセージのcontentがリストの場合、OpenAI互換形式に変換
+        # 一部のローカルLLM（Ollama等）はimage_urlではなくimageで受け取る場合があるが、
+        # OpenAI互換APIではimage_urlが標準
         request_body = {
             "model": self.config.model_name,
-            "messages": self.history.get_context_for_llm(),
+            "messages": messages,
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens
         }

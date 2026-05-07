@@ -16,6 +16,7 @@ import shutil
 import re
 import fnmatch
 import ipaddress
+import tempfile
 from typing import Optional, Any, List, Tuple
 from enum import Enum
 from dataclasses import dataclass, field
@@ -1217,12 +1218,7 @@ class ToolFilter:
         Returns:
             フィルタリングされたツールリスト
         """
-        # 【診断ログ】入力と全ツールを記録
-        logger.info(f"[診断] filter_by_user_input 呼び出し:")
-        logger.info(f"  user_input: {user_input[:100] if user_input else 'None'}...")
-        logger.info(f"  all_tools数: {len(all_tools)}")
-        logger.info(f"  all_tools名一覧: {[t.name for t in all_tools]}")
-        logger.info(f"  enable_server_boost={enable_server_boost}, use_scoring={use_scoring}")
+        logger.debug(f"filter_by_user_input: user_input={user_input[:100] if user_input else 'None'}..., all_tools={len(all_tools)}")
         
         if not user_input:
             return self._apply_round_robin_fallback(all_tools, max_tools)
@@ -1250,13 +1246,13 @@ class ToolFilter:
         
         # Step 1: サーバ推定
         estimated_servers = self.server_estimator.estimate(user_input)
-        logger.info(f"[診断] Step1 サーバ推定: {[(s.server_name, s.confidence, s.match_type) for s in estimated_servers]}")
+        logger.debug(f"Step1 サーバ推定: {[(s.server_name, s.confidence, s.match_type) for s in estimated_servers]}")
         
         # Step 2: ツールスコアリング
         scored_tools = self.tool_scorer.score_tools(
             all_tools, user_input, estimated_servers, self.categories
         )
-        logger.info(f"[診断] Step2 スコアリング完了: 上位5件 {[(st.tool.name, st.score) for st in scored_tools[:5]]}")
+        logger.debug(f"Step2 スコアリング完了: 上位5件 {[(st.tool.name, st.score) for st in scored_tools[:5]]}")
         
         # Step 3: サーバ名リストを取得
         server_names = list(set(t.server_name for t in all_tools if t.server_name))
@@ -1271,11 +1267,11 @@ class ToolFilter:
         quotas = self.quota_manager.calculate_quotas(
             server_names, max_tools, priority_server, min_quota=min_quota
         )
-        logger.info(f"[診断] Step3 クオータ計算: {quotas}")
+        logger.debug(f"Step3 クオータ計算: {quotas}")
         
         # Step 6: ラウンドロビン配置
         final_tools = self.quota_manager.apply_round_robin(scored_tools, quotas, max_tools)
-        logger.info(f"[診断] Step4 ラウンドロビン配置: {[t.name for t in final_tools]}")
+        logger.debug(f"Step4 ラウンドロビン配置: {[t.name for t in final_tools]}")
         
         # Step 7: always_includeツールを追加
         always_tools = [t for t in all_tools if t.name in always_include]
@@ -1286,11 +1282,11 @@ class ToolFilter:
                 if tool.name not in seen:
                     final_tools.insert(0, tool)
                     seen.add(tool.name)
-            logger.info(f"[診断] Step5 always_include追加: {[t.name for t in always_tools]}")
+            logger.debug(f"Step5 always_include追加: {[t.name for t in always_tools]}")
         
         # max_tools制限を適用
         final_tools = final_tools[:max_tools]
-        logger.info(f"[診断] 最終結果: {[t.name for t in final_tools]}")
+        logger.debug(f"最終結果: {[t.name for t in final_tools]}")
         
         # フォールバック: 結果が空の場合
         if not final_tools and all_tools:
@@ -1310,23 +1306,23 @@ class ToolFilter:
         
         # Step 1: カテゴリマッチング
         matched_categories = self._match_categories(user_input)
-        logger.info(f"[診断] Legacy Step1 カテゴリマッチング: {[c.id for c in matched_categories]}")
+        logger.debug(f"Legacy Step1 カテゴリマッチング: {[c.id for c in matched_categories]}")
         
         # Step 2: ツール名パターンマッチング
         candidate_tools = self._match_tool_patterns(all_tools, matched_categories)
-        logger.info(f"[診断] Legacy Step2 パターンマッチング結果: {[t.name for t in candidate_tools]}")
+        logger.debug(f"Legacy Step2 パターンマッチング結果: {[t.name for t in candidate_tools]}")
         
         # Step 3: キーワードベースの追加マッチング
         keyword_tools = self._match_by_keywords(user_input, all_tools)
-        logger.info(f"[診断] Legacy Step3 キーワードマッチング結果: {[t.name for t in keyword_tools]}")
+        logger.debug(f"Legacy Step3 キーワードマッチング結果: {[t.name for t in keyword_tools]}")
         
         # Step 4: 動的カテゴリマッチング（ツール説明から抽出）
         dynamic_tools = self._match_by_description(user_input, all_tools)
-        logger.info(f"[診断] Legacy Step4 動的マッチング結果: {[t.name for t in dynamic_tools]}")
+        logger.debug(f"Legacy Step4 動的マッチング結果: {[t.name for t in dynamic_tools]}")
         
         # Step 5: 常に含めるツールを追加
         always_tools = [t for t in all_tools if t.name in always_include]
-        logger.info(f"[診断] Legacy Step5 always_include結果: {[t.name for t in always_tools]}")
+        logger.debug(f"Legacy Step5 always_include結果: {[t.name for t in always_tools]}")
         
         # Step 6: 結合・重複排除・制限
         final_tools = self._merge_and_limit(
@@ -1336,7 +1332,7 @@ class ToolFilter:
             max_tools,
             dynamic_tools
         )
-        logger.info(f"[診断] Legacy Step6 最終結果: {[t.name for t in final_tools]}")
+        logger.debug(f"Legacy Step6 最終結果: {[t.name for t in final_tools]}")
         
         # フォールバック: マッチするツールがない場合は全ツールから返す
         if not final_tools and all_tools:
@@ -1478,9 +1474,8 @@ class ToolFilter:
         words.extend(translated_keywords)
         words = list(set(words))
         
-        # 【診断ログ】抽出されたキーワード
-        logger.info(f"[診断] _match_by_description 抽出キーワード: {words}")
-        logger.info(f"[診断] _match_by_description 翻訳済みキーワード: {translated_keywords}")
+        logger.debug(f"_match_by_description 抽出キーワード: {words}")
+        logger.debug(f"_match_by_description 翻訳済みキーワード: {translated_keywords}")
         
         matched = []
         for tool in tools:
@@ -1510,8 +1505,7 @@ class ToolFilter:
                 seen.add(tool.name)
                 unique_matched.append(tool)
         
-        # 【診断ログ】マッチ結果
-        logger.info(f"[診断] _match_by_description マッチしたツール: {[t.name for t in unique_matched]}")
+        logger.debug(f"_match_by_description マッチしたツール: {[t.name for t in unique_matched]}")
         
         return unique_matched
     
@@ -1805,6 +1799,148 @@ class ToolExecutionErrorHandler:
 
 
 # ============================================
+# ファイルパス検証・セキュリティ
+# ============================================
+
+class FilePathValidator:
+    """ツール引数内のファイルパスを検証・サニタイズするクラス"""
+    
+    # 危険なパスパターン
+    DANGEROUS_PATTERNS = ["..", "~"]
+    
+    # ファイルパスと見なすキーワード
+    PATH_KEYWORDS = ["path", "file", "filepath", "filename", "dir", "directory", "folder", "src", "dest", "source", "target"]
+    
+    @classmethod
+    def _get_allowed_temp_prefixes(cls) -> list[str]:
+        """許可された一時ディレクトリプレフィックスを取得"""
+        prefixes = [tempfile.gettempdir()]
+        if os.name == 'nt':
+            prefixes.extend([
+                os.environ.get('TEMP', ''),
+                os.environ.get('TMP', ''),
+                os.path.expanduser('~\\AppData\\Local\\Temp'),
+            ])
+        else:
+            prefixes.extend(['/tmp', '/var/tmp'])
+        return [p for p in prefixes if p]
+    
+    @classmethod
+    def is_safe_path(cls, path: str, allowed_paths: set[str] = None) -> bool:
+        """
+        ファイルパスが安全かどうかを判定
+        
+        Args:
+            path: 検証対象のパス
+            allowed_paths: 許可されたパスのセット（UIアップロードされた一時ファイル等）
+            
+        Returns:
+            安全な場合True
+        """
+        if not path or not isinstance(path, str):
+            return True  # 空/非文字列はパスではない
+        
+        # 許可されたパスに完全一致する場合は安全
+        if allowed_paths and path in allowed_paths:
+            return True
+        
+        # パストラバーサルチェック: 正規化後のパスセグメントに .. が含まれるか
+        norm_path = os.path.normpath(path)
+        path_parts = norm_path.split(os.sep)
+        if ".." in path_parts:
+            return False
+        
+        # 絶対パスの場合、許可された一時ディレクトリ内か確認
+        if os.path.isabs(path):
+            allowed_prefixes = cls._get_allowed_temp_prefixes()
+            path_lower = path.lower() if os.name == 'nt' else path
+            for prefix in allowed_prefixes:
+                prefix_lower = prefix.lower() if os.name == 'nt' else prefix
+                if path_lower.startswith(prefix_lower):
+                    return True
+            # 許可された一時ディレクトリ外の絶対パスは拒否
+            return False
+        
+        # 相対パスの場合、危険なパターンをチェック
+        for pattern in cls.DANGEROUS_PATTERNS:
+            if pattern in path:
+                return False
+        
+        return True
+    
+    @classmethod
+    def sanitize_tool_arguments(cls, arguments: dict, allowed_paths: set[str] = None) -> dict:
+        """
+        ツール引数内のファイルパスを検証・サニタイズ
+        
+        Args:
+            arguments: ツール引数辞書
+            allowed_paths: 許可されたパスのセット
+            
+        Returns:
+            サニタイズされた引数辞書
+            
+        Raises:
+            ValueError: 危険なパスが検出された場合
+        """
+        if not arguments:
+            return arguments
+        
+        sanitized = {}
+        for key, value in arguments.items():
+            if key == "file_content_base64":
+                # base64エンコードされたファイル内容はそのまま渡す
+                sanitized[key] = value
+            elif isinstance(value, str) and cls._looks_like_file_path(key, value):
+                if not cls.is_safe_path(value, allowed_paths):
+                    raise ValueError(
+                        f"危険なファイルパスが検出されました: '{value}' (キー: {key}). "
+                        f"パストラバーサルや許可されていないディレクトリへのアクセスが検出されました。"
+                    )
+                # パスを正規化
+                sanitized[key] = os.path.normpath(value)
+            elif isinstance(value, dict):
+                sanitized[key] = cls.sanitize_tool_arguments(value, allowed_paths)
+            elif isinstance(value, list):
+                sanitized_list = []
+                for item in value:
+                    if isinstance(item, dict):
+                        sanitized_list.append(cls.sanitize_tool_arguments(item, allowed_paths))
+                    elif isinstance(item, str) and cls._looks_like_file_path(key, item):
+                        if not cls.is_safe_path(item, allowed_paths):
+                            raise ValueError(
+                                f"危険なファイルパスが検出されました: '{item}' (キー: {key}). "
+                                f"パストラバーサルや許可されていないディレクトリへのアクセスが検出されました。"
+                            )
+                        sanitized_list.append(os.path.normpath(item))
+                    else:
+                        sanitized_list.append(item)
+                sanitized[key] = sanitized_list
+            else:
+                sanitized[key] = value
+        
+        return sanitized
+    
+    @classmethod
+    def _looks_like_file_path(cls, key: str, value: str) -> bool:
+        """キー名と値からファイルパス引数かどうかを推定"""
+        # キー名にファイルパス関連の単語が含まれる場合
+        key_lower = key.lower()
+        if any(kw in key_lower for kw in cls.PATH_KEYWORDS):
+            return True
+        
+        # 値が存在するファイルパスの場合
+        if os.path.exists(value) and len(value) > 1:
+            return True
+        
+        # 値にパス区切り文字が含まれる場合
+        if os.sep in value or (os.name == 'nt' and '/' in value):
+            return True
+        
+        return False
+
+
+# ============================================
 # MCPサーバー接続コンテキスト
 # ============================================
 class MCPServerConnection:
@@ -1877,18 +2013,14 @@ class MCPServerConnection:
             logger.debug(f"  args: {self.config.args}")
             logger.debug(f"  cwd: {self.config.cwd}")
             
-            # 【診断ログ】環境変数の確認
-            logger.info(f"[診断] MCPサーバー '{self.config.name}' の環境変数設定:")
-            logger.info(f"  config.env: {self.config.env}")
-            logger.info(f"  config.env type: {type(self.config.env)}")
+            logger.debug(f"MCPサーバー '{self.config.name}' の環境変数設定: {self.config.env}")
             
             # 環境変数のマージ: 親プロセスの環境変数を継承しつつ、設定値を追加
             import os
             merged_env = os.environ.copy()
             if self.config.env:
                 merged_env.update(self.config.env)
-            logger.info(f"  merged_env keys: {list(merged_env.keys())[:10]}... (showing first 10)")
-            logger.info(f"  REDMINE_URL in merged_env: {'REDMINE_URL' in merged_env}")
+            logger.debug(f"merged_env keys: {list(merged_env.keys())[:10]}...")
             if 'REDMINE_URL' in merged_env:
                 logger.info(f"  REDMINE_URL value: {merged_env.get('REDMINE_URL')}")
             
@@ -2230,6 +2362,8 @@ class MCPServerConnection:
             # 結果をMCP形式のdictに変換
             response = {"content": []}
             
+            logger.debug(f"ツール結果型: {type(result)}, isError={getattr(result, 'isError', False)}")
+            
             if hasattr(result, 'content'):
                 for item in result.content:
                     if hasattr(item, 'type'):
@@ -2247,8 +2381,7 @@ class MCPServerConnection:
             if hasattr(result, 'isError') and result.isError:
                 response["isError"] = True
             
-            logger.info(f"ツール実行完了: {tool_name}")
-            logger.debug(f"結果: {response}")
+            logger.info(f"ツール実行完了: {tool_name}, isError={response.get('isError', False)}")
             
             return response
             
@@ -2346,6 +2479,7 @@ class MCPClientManager:
         self._connections: dict[str, MCPServerConnection] = {}
         self._connected = False
         self._server_context = ServerContext()  # サーバ使用コンテキスト
+        self._uploaded_file_paths: set[str] = set()  # UIからアップロードされた一時ファイルパス
         
         # scoring_rules.jsonの自動検出ロジック
         if scoring_config_path is None:
@@ -2452,17 +2586,12 @@ class MCPClientManager:
         """
         all_tools = await self.get_all_tools()
         
-        # 【診断ログ】全ツールの確認
-        logger.info(f"[診断] get_tools_for_llm 呼び出し:")
-        logger.info(f"  user_input: {user_input[:100] if user_input else 'None'}...")
-        logger.info(f"  server_name: {server_name}")
-        logger.info(f"  all_tools数: {len(all_tools)}")
-        logger.info(f"  all_tools名一覧: {[t.name for t in all_tools]}")
+        logger.debug(f"get_tools_for_llm: user_input={user_input[:100] if user_input else 'None'}..., server_name={server_name}, all_tools={len(all_tools)}")
         
         # サーバー名が指定されている場合：該当サーバーのツールのみを返す
         if server_name:
             server_tools = [t for t in all_tools if t.server_name == server_name]
-            logger.info(f"[診断] サーバー指定フィルタ: {server_name} -> {len(server_tools)}件")
+            logger.debug(f"サーバー指定フィルタ: {server_name} -> {len(server_tools)}件")
             if not server_tools:
                 logger.warning(f"指定されたサーバー '{server_name}' のツールが見つかりません")
             return self._convert_to_openai_tools(server_tools, compression_mode or "compact")
@@ -2474,8 +2603,7 @@ class MCPClientManager:
         comp_mode = compression_mode or settings.get("compression_mode", "compact")
         always_include_list = always_include if always_include is not None else settings.get("always_include", [])
         
-        # 【診断ログ】設定値
-        logger.info(f"[診断] 設定値: filter_enabled={filter_enabled}, max_tools_limit={max_tools_limit}, always_include={always_include_list}")
+        logger.debug(f"設定値: filter_enabled={filter_enabled}, max_tools_limit={max_tools_limit}, always_include={always_include_list}")
         
         # フィルタリング適用
         # 空文字列でもフィルタリングを実行するようNone判定に変更
@@ -2489,8 +2617,7 @@ class MCPClientManager:
         else:
             filtered_tools = all_tools[:max_tools_limit] if max_tools_limit else all_tools
         
-        # 【診断ログ】フィルタリング結果
-        logger.info(f"[診断] フィルタリング結果: {len(filtered_tools)}件, ツール名: {[t.name for t in filtered_tools]}")
+        logger.debug(f"フィルタリング結果: {len(filtered_tools)}件, ツール名: {[t.name for t in filtered_tools]}")
         
         # OpenAI形式に変換（説明圧縮を適用）
         # get_description()がToolDescriptionCompressor.compress()に委譲する
@@ -2510,7 +2637,7 @@ class MCPClientManager:
                 }
             })
         
-        logger.info(f"[診断] LLMに渡すツール定義: {len(tools)}件（フィルタリング: {filter_enabled}, 圧縮モード: {comp_mode}）")
+        logger.info(f"LLMに渡すツール定義: {len(tools)}件（フィルタリング: {filter_enabled}, 圧縮モード: {comp_mode}）")
         return tools
     
     def _convert_to_openai_tools(
@@ -2565,6 +2692,81 @@ class MCPClientManager:
         """
         return self._tool_filter.get_category_summary()
     
+    def register_uploaded_file(self, file_path: str) -> None:
+        """
+        Chainlit UIからアップロードされた一時ファイルパスを登録
+        
+        Args:
+            file_path: アップロードされたファイルの一時パス
+        """
+        if file_path and os.path.exists(file_path):
+            self._uploaded_file_paths.add(file_path)
+            logger.info(f"アップロードファイルを登録: {file_path}")
+    
+    def clear_uploaded_files(self) -> None:
+        """登録されたアップロードファイルパスをクリア"""
+        self._uploaded_file_paths.clear()
+        logger.info("アップロードファイル登録をクリアしました")
+    
+    def _convert_file_arguments(self, arguments: dict, tool_name: str) -> dict:
+        """
+        MCPツール引数内のファイルパスを、base64エンコードされたファイル内容に変換する。
+        
+        read_document_file ツールの場合、filepath 引数が一時ファイルディレクトリ内の
+        ファイルを指している場合、ファイル内容をbase64化して file_content_base64 + filename
+        に置き換える。これにより、DeskToDo側の許可ディレクトリ制限を回避できる。
+        
+        Args:
+            arguments: ツール引数辞書
+            tool_name: ツール名
+            
+        Returns:
+            変換後の引数辞書
+        """
+        if tool_name != "read_document_file":
+            return arguments
+        
+        if not arguments or "filepath" not in arguments:
+            return arguments
+        
+        filepath = arguments["filepath"]
+        
+        # ファイルが存在するか確認
+        if not os.path.exists(filepath):
+            return arguments
+        
+        # ファイルサイズチェック（10MB上限）
+        try:
+            file_size = os.path.getsize(filepath)
+            max_size = 10 * 1024 * 1024  # 10MB
+            if file_size > max_size:
+                logger.warning(f"ファイルサイズが10MBを超えるため、base64変換をスキップします: {filepath} ({file_size / 1024 / 1024:.2f}MB)")
+                return arguments
+        except Exception as e:
+            logger.warning(f"ファイルサイズ取得エラー: {e}")
+            return arguments
+        
+        # base64エンコード
+        try:
+            import base64
+            with open(filepath, "rb") as f:
+                file_content = f.read()
+            file_content_base64 = base64.b64encode(file_content).decode("utf-8")
+            filename = os.path.basename(filepath)
+            
+            logger.info(f"ファイルをbase64変換しました: {filename} ({file_size} bytes -> {len(file_content_base64)} chars)")
+            
+            # filepathを元のパスのまま残す（MCPサーバー側のPydanticバリデーション対策）
+            # file_content_base64が優先されるため、filepathは無視される
+            return {
+                "filepath": filepath,
+                "file_content_base64": file_content_base64,
+                "filename": filename
+            }
+        except Exception as e:
+            logger.error(f"ファイルのbase64変換エラー: {e}")
+            return arguments
+    
     async def call_tool(
         self,
         server_name: str,
@@ -2599,6 +2801,20 @@ class MCPClientManager:
         
         logger.info(f"ツール実行要求: {actual_server_name}.{actual_tool_name}" if actual_server_name else f"ツール実行要求: {actual_tool_name}")
         
+        # ファイルパス引数の検証・サニタイズ（セキュリティ）
+        try:
+            # read_document_file の場合、filepath を file_content_base64 に自動変換
+            converted_arguments = self._convert_file_arguments(arguments, actual_tool_name)
+            sanitized_arguments = FilePathValidator.sanitize_tool_arguments(
+                converted_arguments, allowed_paths=self._uploaded_file_paths
+            )
+        except ValueError as e:
+            logger.error(f"ファイルパス検証エラー: {e}")
+            return {
+                "content": [{"type": "text", "text": f"❌ セキュリティエラー: {str(e)}"}],
+                "isError": True
+            }
+        
         # サーバー名が指定されている場合は直接検索
         if actual_server_name and actual_server_name in self._connections:
             target_connection = self._connections[actual_server_name]
@@ -2612,7 +2828,7 @@ class MCPClientManager:
                 }
             # サーバコンテキストに記録
             self._server_context.record_tool_usage(actual_server_name)
-            return await target_connection.call_tool(actual_tool_name, arguments)
+            return await target_connection.call_tool(actual_tool_name, sanitized_arguments)
         
         # サーバー名がない場合は全サーバーから検索
         target_connection = None
@@ -2637,7 +2853,7 @@ class MCPClientManager:
         if found_server_name:
             self._server_context.record_tool_usage(found_server_name)
         
-        return await target_connection.call_tool(actual_tool_name, arguments)
+        return await target_connection.call_tool(actual_tool_name, sanitized_arguments)
     
     # ============================================
     # ヘルスチェック
