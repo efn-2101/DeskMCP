@@ -8,17 +8,8 @@
     "max_tokens": 16384
   },
   "context_management": {
-    "hard_limit_tokens": 32000,
-    "soft_limit_tokens": 24000,
-    "tool_definition_budget_tokens": 8000,
-    "message_history_budget_tokens": 8000,
-    "tool_result_pruning": {
-      "read_max_chars": 4000,
-      "write_max_chars": 2000,
-      "info_max_chars": 1000,
-      "default_max_chars": 3000,
-      "soft_limit_tokens": 2000
-    }
+    "max_context_tokens": 128000,
+    "tool_result_max_chars": 100000
   },
   "agent_safeguards": {
     "max_repeated_loops": 3,

@@ -2127,17 +2127,16 @@ class MCPServerConnection:
             resolved_type, resolved_schema = _resolve_schema_type(prop_schema)
             value = arguments.get(key) if arguments else None
             
+            # オプショナルパラメータでNoneの場合は省略（ツールのデフォルト値を使用）
+            if value is None and key not in required_props:
+                continue
+            
             # type: "object"のプロパティに対して正規化
             if resolved_type == "object":
                 if value is None:
-                    # None、undefined、または引数が渡されていない場合
-                    if key in required_props:
-                        # 必須引数の場合は空オブジェクトを設定し、ネストされた必須プロパティも処理
-                        logger.info(f"[正規化] 必須引数 '{key}' が未指定のため空オブジェクトで初期化")
-                        normalized[key] = self._normalize_nested_object({}, resolved_schema)
-                    else:
-                        # オプション引数の場合はNoneのまま
-                        normalized[key] = None
+                    # 必須引数の場合は空オブジェクトを設定し、ネストされた必須プロパティも処理
+                    logger.info(f"[正規化] 必須引数 '{key}' が未指定のため空オブジェクトで初期化")
+                    normalized[key] = self._normalize_nested_object({}, resolved_schema)
                 elif isinstance(value, str):
                     # 文字列の場合は空オブジェクトに変換
                     if value.strip():
@@ -2165,7 +2164,20 @@ class MCPServerConnection:
                 else:
                     normalized[key] = value
             else:
-                normalized[key] = value
+                # その他の型（string, number, integer, boolean）
+                if value is None:
+                    # 必須パラメータのデフォルト値設定
+                    if resolved_type == "string":
+                        enum_values = resolved_schema.get("enum")
+                        normalized[key] = enum_values[0] if enum_values else ""
+                    elif resolved_type in ("number", "integer"):
+                        normalized[key] = 0
+                    elif resolved_type == "boolean":
+                        normalized[key] = False
+                    else:
+                        normalized[key] = value
+                else:
+                    normalized[key] = value
         
         # argumentsに含まれる追加のプロパティがあればコピー
         if arguments:

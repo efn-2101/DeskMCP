@@ -85,7 +85,7 @@ def load_system_config() -> dict:
 
 
 def _get_default_config() -> dict:
-    """デフォルト設定を返す"""
+    """デフォルト設定を返す（新スキーマ: シンプル版）"""
     return {
         "llm_settings": {
             "provider": "ollama",
@@ -96,10 +96,8 @@ def _get_default_config() -> dict:
             "max_tokens": 4096
         },
         "context_management": {
-            "hard_limit_tokens": 32000,
-            "soft_limit_tokens": 24000,
-            "tool_definition_budget_tokens": 8000,
-            "message_history_budget_tokens": 8000
+            "max_context_tokens": 128000,
+            "tool_result_max_chars": 4000
         },
         "agent_safeguards": {
             "max_repeated_loops": 3,
@@ -206,7 +204,8 @@ ENHANCED_SYSTEM_PROMPT_TEMPLATE = """
 
 1. **応答フォーマット**:
    - コードや設定値は必ずMarkdownのコードブロック（```）で囲んでください
-   - 表形式のデータはMarkdownテーブルを使用してください
+   - 表形式のデータは**必ずMarkdownテーブル**を使用してください
+   - **HTMLテーブル（`<table>`タグ等）は絶対に使用しないでください**
    - 箇条書きは `- ` または `1. ` を使用してください
    - 重要な注意事項は **太字** で強調してください
 
@@ -342,6 +341,12 @@ class DynamicSystemPromptGenerator:
         else:
             sections.append("あなたは親切で有能なAIアシスタントです。")
         
+        # 応答フォーマット指示
+        sections.append("\n## 応答フォーマット\n")
+        sections.append("- 表形式のデータは**必ずMarkdownテーブル**を使用してください\n")
+        sections.append("- **HTMLテーブル（`<table>`タグ等）は絶対に使用しないでください**\n")
+        sections.append("- コードや設定値は必ずMarkdownのコードブロック（```）で囲んでください\n")
+        
         # ツール使用ガイドライン
         sections.append("\n## 利用可能なMCPサーバとツール\n")
         
@@ -406,18 +411,22 @@ class AgentConfig:
     inference_timeout_seconds: int = 180
     tool_execution_timeout_seconds: int = 60
     
-    # コンテキスト管理設定
-    hard_limit_tokens: int = 32000
-    soft_limit_tokens: int = 24000
-    tool_definition_budget_tokens: int = 8000
-    message_history_budget_tokens: int = 8000
+    # コンテキスト管理設定（シンプル化: 1つのmax_context_tokensで統一）
+    max_context_tokens: int = 128000  # コンテキスト全体の上限
+    tool_result_max_chars: int = 100000  # ツール結果安全弁閾値（1ツール結果の最大文字数、超過時のみ切り詰め）
     
-    # ツール結果Pruning設定
-    tool_result_read_max_chars: int = 4000
-    tool_result_write_max_chars: int = 2000
-    tool_result_info_max_chars: int = 1000
-    tool_result_default_max_chars: int = 3000
-    pruning_soft_limit_tokens: int = 2000
+    # 内部計算用（max_context_tokensから自動導出、直接設定不要）
+    hard_limit_tokens: int = field(init=False)
+    soft_limit_tokens: int = field(init=False)
+    tool_definition_budget_tokens: int = field(init=False)
+    message_history_budget_tokens: int = field(init=False)
+    
+    # ツール結果Pruning設定（後方互換、内部計算用）
+    tool_result_read_max_chars: int = field(init=False)
+    tool_result_write_max_chars: int = field(init=False)
+    tool_result_info_max_chars: int = field(init=False)
+    tool_result_default_max_chars: int = field(init=False)
+    pruning_soft_limit_tokens: int = field(init=False)
     
     # LLM設定
     base_url: str = "http://localhost:11434/v1"
@@ -437,34 +446,67 @@ class AgentConfig:
     always_include: list = field(default_factory=lambda: ["get_server_info"])
     compression_mode: str = "compact"  # full, compact, minimal
     
+    def __post_init__(self):
+        """派生値を自動計算"""
+        # コンテキスト予算の自動配分
+        self.hard_limit_tokens = self.max_context_tokens
+        self.soft_limit_tokens = int(self.max_context_tokens * 0.75)
+        self.tool_definition_budget_tokens = int(self.max_context_tokens * 0.25)
+        self.message_history_budget_tokens = int(self.max_context_tokens * 0.5)
+        
+        # ツール結果Pruningの自動配分（後方互換・内部計算用）
+        # 即座切り詰めは廃止され、安全弁のみ使用
+        self.tool_result_read_max_chars = self.tool_result_max_chars
+        self.tool_result_write_max_chars = self.tool_result_max_chars
+        self.tool_result_info_max_chars = self.tool_result_max_chars
+        self.tool_result_default_max_chars = self.tool_result_max_chars
+        self.pruning_soft_limit_tokens = self.tool_result_max_chars  # MessageHistoryの即座Pruning閾値（大きな値に）
+    
     @classmethod
     def from_dict(cls, config: dict) -> "AgentConfig":
-        """設定辞書からAgentConfigを作成"""
+        """設定辞書からAgentConfigを作成（旧設定からの自動変換対応）"""
         llm_settings = config.get("llm_settings", {})
         context_mgmt = config.get("context_management", {})
         safeguards = config.get("agent_safeguards", {})
         tool_filter = config.get("tool_filter_settings", {})
         prompt_settings = config.get("system_prompt_settings", {})
         
-        # ツール結果Pruning設定（ネストされた設定を読み込み）
-        tool_pruning = context_mgmt.get("tool_result_pruning", {})
+        # --- 新設定（シンプル版）の読み込み ---
+        max_context_tokens = context_mgmt.get("max_context_tokens")
+        tool_result_max_chars = context_mgmt.get("tool_result_max_chars")
+        
+        # --- 旧設定からの自動変換（後方互換） ---
+        if max_context_tokens is None:
+            # 旧: hard_limit_tokens / soft_limit_tokens から変換
+            old_hard = context_mgmt.get("hard_limit_tokens")
+            old_soft = context_mgmt.get("soft_limit_tokens")
+            if old_hard is not None:
+                max_context_tokens = old_hard
+                logger.info(f"旧設定 'hard_limit_tokens={old_hard}' を 'max_context_tokens' に自動変換しました")
+            elif old_soft is not None:
+                max_context_tokens = int(old_soft / 0.75)
+                logger.info(f"旧設定 'soft_limit_tokens={old_soft}' を 'max_context_tokens={max_context_tokens}' に自動変換しました")
+            else:
+                max_context_tokens = 128000  # デフォルト
+        
+        if tool_result_max_chars is None:
+            # 旧: tool_result_pruning から変換
+            tool_pruning = context_mgmt.get("tool_result_pruning", {})
+            old_read = tool_pruning.get("read_max_chars")
+            if old_read is not None:
+                tool_result_max_chars = old_read
+                logger.info(f"旧設定 'tool_result_pruning.read_max_chars={old_read}' を 'tool_result_max_chars' に自動変換しました")
+            else:
+                tool_result_max_chars = 4000  # デフォルト
         
         return cls(
             # セーフガード
             max_repeated_loops=safeguards.get("max_repeated_loops", 3),
             inference_timeout_seconds=safeguards.get("inference_timeout_seconds", 180),
             tool_execution_timeout_seconds=safeguards.get("tool_execution_timeout_seconds", 60),
-            # コンテキスト管理
-            hard_limit_tokens=context_mgmt.get("hard_limit_tokens", 32000),
-            soft_limit_tokens=context_mgmt.get("soft_limit_tokens", 24000),
-            tool_definition_budget_tokens=context_mgmt.get("tool_definition_budget_tokens", 8000),
-            message_history_budget_tokens=context_mgmt.get("message_history_budget_tokens", 8000),
-            # ツール結果Pruning設定
-            tool_result_read_max_chars=tool_pruning.get("read_max_chars", 4000),
-            tool_result_write_max_chars=tool_pruning.get("write_max_chars", 2000),
-            tool_result_info_max_chars=tool_pruning.get("info_max_chars", 1000),
-            tool_result_default_max_chars=tool_pruning.get("default_max_chars", 3000),
-            pruning_soft_limit_tokens=tool_pruning.get("soft_limit_tokens", 2000),
+            # コンテキスト管理（シンプル版）
+            max_context_tokens=max_context_tokens,
+            tool_result_max_chars=tool_result_max_chars,
             # LLM設定
             base_url=llm_settings.get("base_url", "http://localhost:11434/v1"),
             model_name=llm_settings.get("model_name", "gemma3:latest"),
@@ -513,7 +555,8 @@ class MessageHistory:
     def __init__(self, system_prompt: str = "",
                  hard_limit_tokens: int = 8192,
                  soft_limit_tokens: int = 6000,
-                 message_history_budget_tokens: int = 2000):
+                 message_history_budget_tokens: int = 2000,
+                 pruning_soft_limit_tokens: int = 2000):
         """
         初期化
         
@@ -522,6 +565,7 @@ class MessageHistory:
             hard_limit_tokens: ハードリミット（トークン数）
             soft_limit_tokens: ソフトリミット（トークン数）
             message_history_budget_tokens: メッセージ履歴の予算（トークン数）
+            pruning_soft_limit_tokens: ツール結果Pruningのソフトリミット（トークン数）
         """
         self.messages: list[dict] = []
         self._system_prompt = system_prompt
@@ -531,6 +575,7 @@ class MessageHistory:
         self._hard_limit_tokens = hard_limit_tokens
         self._soft_limit_tokens = soft_limit_tokens
         self._message_history_budget_tokens = message_history_budget_tokens
+        self._pruning_soft_limit_tokens = pruning_soft_limit_tokens
         
         # システムプロンプトを追加
         if system_prompt:
@@ -601,31 +646,25 @@ class MessageHistory:
     
     def add_tool_result(self, tool_call_id: str, tool_name: str, raw_result: dict, summary: str) -> None:
         """
-        ツール実行結果を追加（Pruning適用）
+        ツール実行結果を追加
         
-        仕様書6.3: ツール出力データの即時剪定
-        - LLMが回答生成後に、巨大なツール実行結果を極小テキストに置換
-        - AIの思考結果のみを履歴に残す
+        ツール結果は原則そのまま保持。コンテキスト全体の圧縮は
+        get_context_for_llm() -> _trim_to_budget() で行う。
         
         Args:
             tool_call_id: ツール呼び出しID
             tool_name: ツール名
             raw_result: 生のツール実行結果
-            summary: 要約テキスト
+            summary: 要約テキスト（安全弁適用済みのテキスト）
         """
-        # 生の結果からコンテンツを抽出
-        content = self._extract_content(raw_result)
-        
-        # Pruning: 大きなコンテンツは要約に置換
-        pruned_content = self._prune_content(content, summary)
-        
+        # summaryは既にAgent._summarize_tool_resultで安全弁処理済み
         self.messages.append({
             "role": "tool",
             "tool_call_id": tool_call_id,
             "name": tool_name,
-            "content": pruned_content
+            "content": summary
         })
-        logger.debug(f"ツール結果追加: {tool_name} -> {pruned_content[:50]}...")
+        logger.debug(f"ツール結果追加: {tool_name} -> {summary[:50]}...")
     
     def _extract_content(self, raw_result: dict) -> str:
         """生の結果からコンテンツを抽出"""
@@ -645,7 +684,7 @@ class MessageHistory:
         """
         コンテンツのPruning処理
         
-        仕様書6.3: 即時OOMの防止（上限ガード���
+        仕様書6.3: 即時OOMの防止（上限ガード）
         - ソフトリミット超過時は先頭保持の切り詰め
         - ハードリミットはprune_large_contentで対応
         
@@ -657,11 +696,10 @@ class MessageHistory:
         estimated_tokens = len(content) / 3
         
         # ソフトリミット超過時は先頭保持の切り詰め
-        soft_limit_tokens = 2000  # デフォルト値（設定値はAgentConfigから取得予定）
-        soft_limit_chars = soft_limit_tokens * 3  # ≈6000文字
+        soft_limit_chars = self._pruning_soft_limit_tokens * 3  # ≈文字数
         
-        if estimated_tokens > soft_limit_tokens:
-            logger.info(f"コンテンツをPruning: {estimated_tokens:.0f}トークン -> {soft_limit_tokens}トークンに切り詰め")
+        if estimated_tokens > self._pruning_soft_limit_tokens:
+            logger.info(f"コンテンツをPruning: {estimated_tokens:.0f}トークン -> {self._pruning_soft_limit_tokens}トークンに切り詰め")
             return content[:soft_limit_chars] + "\n... [コンテキスト予算のため省略]"
         
         return content
@@ -789,14 +827,18 @@ class MessageHistory:
         # 日本語部分は1.5文字/トークン、それ以外は4文字/トークン
         return (japanese_chars / 1.5) + (other_chars / 4.0)
     
-    def _summarize_message(self, msg: dict) -> dict | None:
+    def _summarize_message(self, msg: dict, aggressive: bool = False) -> dict | None:
         """
         メッセージを要約版に変換
         
-        - tool メッセージ: 先頭500文字に切り詰め
+        - tool メッセージ: 先頭500文字（通常）/ 100文字（積極的圧縮）に切り詰め
         - assistant メッセージ: 先頭400文字に切り詰め
         - user メッセージ: 先頭400文字に切り詰め（マルチモーダルは要約しない）
         - tool_calls を含む assistant メッセージ: 要約しない（構造を保持）
+        
+        Args:
+            msg: 要約対象メッセージ
+            aggressive: Trueの場合、toolメッセージをより積極的に圧縮
         """
         role = msg.get("role", "")
         content = msg.get("content", "")
@@ -813,8 +855,9 @@ class MessageHistory:
             return None
         
         if role == "tool":
-            if len(content) > 500:
-                return {**msg, "content": content[:500] + "\n... [要約]"}
+            limit = 100 if aggressive else 500
+            if len(content) > limit:
+                return {**msg, "content": content[:limit] + f"\n... [要約: 全{len(content)}文字]"}
         elif role == "assistant":
             if len(content) > 400:
                 return {**msg, "content": content[:400] + "\n... [要約]"}
@@ -826,14 +869,13 @@ class MessageHistory:
     
     def _trim_to_budget(self) -> list:
         """
-        予算内に収まるようメッセージをトリミング
+        予算内に収まるようメッセージを段階的に圧縮
         
-        戦略:
+        戦略（Roo Code方式）:
         1. system メッセージは常に保持
         2. 最新の user メッセージは常に保持
-        3. 古いメッセージから順に、soft_limit→要約、hard_limit→削除
+        3. 古いメッセージから順に、soft_limit超過時に要約→積極的要約→削除
         """
-        result = []
         system_msgs = []
         latest_user_msg = None
         
@@ -853,36 +895,77 @@ class MessageHistory:
         if latest_user_msg:
             priority_tokens += self._estimate_messages_tokens([latest_user_msg])
         
-        # 残り予算
+        # --- Phase 1: 通常要約（soft_limit超過時、古い順に要約） ---
         remaining_budget = self._soft_limit_tokens - priority_tokens
-        
-        # 新しい順にメッセージを追加（予算内で）
-        added_msgs = []
+        phase1_msgs = []
         for msg in reversed(other_msgs):
             msg_tokens = self._estimate_messages_tokens([msg])
             if remaining_budget >= msg_tokens:
-                added_msgs.append(msg)
+                phase1_msgs.append(msg)
                 remaining_budget -= msg_tokens
             else:
-                # 予算不足: 要約に置換
-                summarized = self._summarize_message(msg)
+                # 予算不足: 通常要約を試行
+                summarized = self._summarize_message(msg, aggressive=False)
                 if summarized:
                     summarized_tokens = self._estimate_messages_tokens([summarized])
                     if remaining_budget >= summarized_tokens:
-                        added_msgs.append(summarized)
+                        phase1_msgs.append(summarized)
                         remaining_budget -= summarized_tokens
                 break  # これ以上古いメッセージは追加しない
         
-        # 構築: system + 古い順のother + latest_user
-        added_msgs.reverse()
-        result = system_msgs + added_msgs
+        phase1_msgs.reverse()
+        result = system_msgs + phase1_msgs
         if latest_user_msg:
             result.append(latest_user_msg)
         
-        # hard_limitの最終チェック
         total = self._estimate_messages_tokens(result)
+        
+        # --- Phase 2: 積極的要約（まだsoft_limit超過なら、古いtool結果を積極的圧縮） ---
+        if total > self._soft_limit_tokens:
+            remaining_budget = self._soft_limit_tokens - priority_tokens
+            phase2_msgs = []
+            aggressive_done = False  # 積極圧縮は1回のみ（最も古い大きいtoolメッセージ）
+            
+            for msg in reversed(other_msgs):
+                msg_tokens = self._estimate_messages_tokens([msg])
+                
+                # まだ予算内ならそのまま追加
+                if remaining_budget >= msg_tokens and not aggressive_done:
+                    phase2_msgs.append(msg)
+                    remaining_budget -= msg_tokens
+                    continue
+                
+                # 予算不足または積極圧縮済み: 要約を試行
+                if not aggressive_done and msg.get("role") == "tool":
+                    # 最も古い大きいtoolメッセージを積極的圧縮
+                    summarized = self._summarize_message(msg, aggressive=True)
+                    if summarized:
+                        summarized_tokens = self._estimate_messages_tokens([summarized])
+                        if remaining_budget >= summarized_tokens:
+                            phase2_msgs.append(summarized)
+                            remaining_budget -= summarized_tokens
+                            aggressive_done = True
+                            continue
+                
+                # 通常要約を試行
+                summarized = self._summarize_message(msg, aggressive=False)
+                if summarized:
+                    summarized_tokens = self._estimate_messages_tokens([summarized])
+                    if remaining_budget >= summarized_tokens:
+                        phase2_msgs.append(summarized)
+                        remaining_budget -= summarized_tokens
+                
+                break  # これ以上古いメッセージは追加しない
+            
+            phase2_msgs.reverse()
+            result = system_msgs + phase2_msgs
+            if latest_user_msg:
+                result.append(latest_user_msg)
+            
+            total = self._estimate_messages_tokens(result)
+        
+        # --- Phase 3: hard_limit適用（それでも超過なら古いメッセージから削除） ---
         if total > self._hard_limit_tokens:
-            # hard_limit超過: 最も古いotherメッセージから削除
             result = self._enforce_hard_limit(result, system_msgs, latest_user_msg)
         
         logger.info(f"コンテキスト予算トリミング: {self._estimate_total_tokens()} -> "
@@ -999,7 +1082,15 @@ class Agent:
 ※ 接続中のMCPサーバのツール一覧は、初回の会話時に動的に追加されます。
 """
         
-        self.history = MessageHistory(system_prompt=initial_prompt)
+        # 【バグ修正】MessageHistoryにAgentConfigの値を正しく渡す
+        self.history = MessageHistory(
+            system_prompt=initial_prompt,
+            hard_limit_tokens=self.config.hard_limit_tokens,
+            soft_limit_tokens=self.config.soft_limit_tokens,
+            message_history_budget_tokens=self.config.message_history_budget_tokens,
+            pruning_soft_limit_tokens=self.config.pruning_soft_limit_tokens
+        )
+        
         self._cancel_requested = False  # キルスイッチ用フラグ
         self._tool_call_counter = {}  # 連続呼び出し検知用
         self._rejection_occurred = False  # ユーザー拒否発生フラグ（LLM暴走防止用）
@@ -1587,68 +1678,20 @@ class Agent:
         
         return result
     
-    def _categorize_tool(self, tool_name: str) -> str:
-        """
-        ツール名からカテゴリを判定
-        
-        Args:
-            tool_name: ツール名
-            
-        Returns:
-            "read" / "write" / "info" / "default"
-        """
-        name_lower = tool_name.lower()
-        
-        # 情報系（メタデータのみ返すツール）- 先に判定（get_系より優先）
-        if any(name_lower.startswith(p) for p in
-               ["get_server_info", "get_task_statistics", "get_config", "backup_"]):
-            return "info"
-        
-        # 参照系（データを読み取るツール）
-        if any(name_lower.startswith(p) for p in
-               ["list_", "get_", "search_", "fuzzy_", "semantic_", "read_", "show_"]):
-            return "read"
-        
-        # 更新系（データを変更するツール）
-        if any(name_lower.startswith(p) for p in
-               ["add_", "update_", "delete_", "create_", "remove_", "complete_", "archive_", "restore_"]):
-            return "write"
-        
-        return "default"
-    
-    def _get_tool_result_max_chars(self, tool_name: str) -> int:
-        """
-        ツール名に基づいて結果の最大文字数を返す
-        
-        Args:
-            tool_name: ツール名（例: "list_pending_tasks"）
-            
-        Returns:
-            最大文字数
-        """
-        category = self._categorize_tool(tool_name)
-        limits = {
-            "read": self.config.tool_result_read_max_chars,
-            "write": self.config.tool_result_write_max_chars,
-            "info": self.config.tool_result_info_max_chars,
-            "default": self.config.tool_result_default_max_chars,
-        }
-        return limits.get(category, self.config.tool_result_default_max_chars)
-    
     def _summarize_tool_result(self, tool_name: str, raw_result: dict) -> str:
         """
-        ツール実行結果の要約（Pruning用）
+        ツール実行結果の安全弁処理
         
-        仕様書6.3に基づく要約生成
-        - ツールカテゴリ別の文字数上限で先頭保持+省略表示
-        - 500文字以下の結果はそのまま保持
+        原則としてツール結果はそのまま保持し、コンテキスト全体の圧縮は
+        MessageHistory._trim_to_budget() で行う。
+        本メソッドは極端に巨大な結果に対する安全弁のみ。
         
         Args:
             tool_name: ツール名
             raw_result: 生のツール実行結果
             
         Returns:
-            要約テキスト
+            処理後のテキスト（通常はそのまま）
         """
         # 結果からテキストを抽出
         if isinstance(raw_result, dict):
@@ -1664,17 +1707,12 @@ class Agent:
         else:
             result_text = str(raw_result)
         
-        # ツールカテゴリ別の閾値を取得
-        max_chars = self._get_tool_result_max_chars(tool_name)
+        # 安全弁: tool_result_max_chars を超える場合のみ切り詰め
+        safety_limit = self.config.tool_result_max_chars
         
-        # 500文字以下はそのまま保持
-        if len(result_text) <= 500:
-            return result_text
-        
-        # 閾値超過時は先頭保持の切り詰め
-        if len(result_text) > max_chars:
-            logger.info(f"ツール結果をPruning: {tool_name} ({len(result_text)}文字 -> {max_chars}文字)")
-            return result_text[:max_chars] + f"\n... [続きは省略されました。全{len(result_text)}文字中{max_chars}文字表示]"
+        if len(result_text) > safety_limit:
+            logger.warning(f"ツール結果が安全弁を超過: {tool_name} ({len(result_text)}文字 -> {safety_limit}文字)")
+            return result_text[:safety_limit] + f"\n... [結果が長すぎるため切り詰め: 全{len(result_text)}文字中{safety_limit}文字表示]"
         
         return result_text
     

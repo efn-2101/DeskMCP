@@ -358,6 +358,27 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+class ConnectionContext:
+    """
+    データベース接続のコンテキストマネージャ。
+    
+    接続の取得と確実なクローズを保証する。
+    エラー発生時も conn.close() が呼ばれる。
+    """
+    
+    def __init__(self):
+        self.conn = None
+    
+    def __enter__(self):
+        self.conn = get_connection()
+        return self.conn
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            self.conn.close()
+        return False
+
+
 def backup_database() -> str:
     """
     データベースのバックアップを作成します。
@@ -365,11 +386,11 @@ def backup_database() -> str:
     バックアップ先は環境変数 DESKTODO_BACKUP_DIR またはデータベースと同一ディレクトリに保存されます。
     バックアップファイル名は `desktodo_tasks.db.backup.YYYYMMDD_HHMMSS` 形式です。
     
+    WALモード使用時も、SQLiteのバックアップAPIを使用して安全に完全バックアップを行います。
+    
     Returns:
         str: 「バックアップを作成しました: {backup_path}」または「バックアップ作成に失敗しました: {error}」
     """
-    import shutil
-    
     logger = get_logger()
     
     try:
@@ -396,22 +417,28 @@ def backup_database() -> str:
         backup_filename = f"desktodo_tasks.db.backup.{timestamp}"
         backup_path = os.path.join(backup_dir, backup_filename)
         
-        # データベースのバックアップ
-        # 注: SQLiteのバックアップは、データベースが使用中でも安全にコピーできるよう
-        # VACUUMコマンドを使用してデータベースを最適化してからコピーする
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # データベースを最適化（オプション）
-        try:
-            cursor.execute('PRAGMA optimize')
-        except Exception:
-            pass  # 最適化エラーは無視
-        
-        conn.close()
-        
-        # ファイルのコピー
-        shutil.copy2(db_path, backup_path)
+        # SQLiteのバックアップAPIを使用して安全にバックアップ
+        # WALモード使用時も、WALファイルの内容を含めた完全なバックアップが作成される
+        with ConnectionContext() as src_conn:
+            # データベースを最適化（オプション）
+            try:
+                src_conn.execute('PRAGMA optimize')
+            except Exception:
+                pass  # 最適化エラーは無視
+            
+            # チェックポイントを実行してWALファイルの内容をメインデータベースに反映
+            try:
+                src_conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            except Exception:
+                pass  # チェックポイントエラーは無視
+            
+            # SQLiteのバックアップAPIを使用
+            dst_conn = sqlite3.connect(backup_path)
+            try:
+                with dst_conn:
+                    src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
         
         logger.info(f"バックアップを作成しました: {backup_path}")
         return t('backup.success', backup_path)
@@ -556,39 +583,43 @@ def init_db() -> None:
         ''')
         
         # FTS5仮想テーブルの作成
+        # content='tasks' を指定した外部コンテンツテーブルは、
+        # 親テーブルのデータを自動的に参照する
+        # トリガーによる明示的なインデックス更新で、確実に同期を保つ
+        # tokenize='trigram' を指定して日本語の部分一致検索を可能にする
         cursor.execute('''
             CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
-                id UNINDEXED,
                 title,
                 description,
                 content='tasks',
-                content_rowid='id'
+                content_rowid='id',
+                tokenize='trigram'
             )
         ''')
         
         # FTS5トリガーの作成（INSERT時）
         cursor.execute('''
             CREATE TRIGGER IF NOT EXISTS tasks_ai AFTER INSERT ON tasks BEGIN
-                INSERT INTO tasks_fts(rowid, id, title, description)
-                VALUES (new.id, new.id, new.title, new.description);
+                INSERT INTO tasks_fts(rowid, title, description)
+                VALUES (new.id, new.title, new.description);
             END
         ''')
         
         # FTS5トリガーの作成（DELETE時）
         cursor.execute('''
             CREATE TRIGGER IF NOT EXISTS tasks_ad AFTER DELETE ON tasks BEGIN
-                INSERT INTO tasks_fts(tasks_fts, rowid, id, title, description)
-                VALUES('delete', old.id, old.id, old.title, old.description);
+                INSERT INTO tasks_fts(tasks_fts, rowid, title, description)
+                VALUES('delete', old.id, old.title, old.description);
             END
         ''')
         
         # FTS5トリガーの作成（UPDATE時）
         cursor.execute('''
             CREATE TRIGGER IF NOT EXISTS tasks_au AFTER UPDATE ON tasks BEGIN
-                INSERT INTO tasks_fts(tasks_fts, rowid, id, title, description)
-                VALUES('delete', old.id, old.id, old.title, old.description);
-                INSERT INTO tasks_fts(rowid, id, title, description)
-                VALUES (new.id, new.id, new.title, new.description);
+                INSERT INTO tasks_fts(tasks_fts, rowid, title, description)
+                VALUES('delete', old.id, old.title, old.description);
+                INSERT INTO tasks_fts(rowid, title, description)
+                VALUES (new.id, new.title, new.description);
             END
         ''')
         
@@ -1259,18 +1290,17 @@ def add_task(
         auto_due = True
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの登録
-        cursor.execute('''
-            INSERT INTO tasks (title, description, due_date, status, priority, created_at)
-            VALUES (?, ?, ?, 'pending', 'medium', datetime('now'))
-        ''', (title.strip(), description, due_date))
-        
-        task_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの登録
+            cursor.execute('''
+                INSERT INTO tasks (title, description, due_date, status, priority, created_at)
+                VALUES (?, ?, ?, 'pending', 'medium', datetime('now'))
+            ''', (title.strip(), description, due_date))
+            
+            task_id = cursor.lastrowid
+            conn.commit()
         
         logger.info(f"タスクを登録しました: #{task_id} '{title}' (期日: {due_date})")
         
@@ -1314,19 +1344,24 @@ def list_pending_tasks(
     offset = max(0, offset)
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, title, due_date, priority, category
-            FROM tasks
-            WHERE status = 'pending'
-            ORDER BY due_date ASC
-            LIMIT ? OFFSET ?
-        ''', (limit, offset))
-        
-        tasks = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # 総件数を取得
+            cursor.execute('''
+                SELECT COUNT(*) FROM tasks WHERE status = 'pending'
+            ''')
+            total_count = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT id, title, due_date, priority, category
+                FROM tasks
+                WHERE status = 'pending'
+                ORDER BY due_date ASC
+                LIMIT ? OFFSET ?
+            ''', (limit, offset))
+            
+            tasks = cursor.fetchall()
         
         if not tasks:
             return t('task.no_pending')
@@ -1343,7 +1378,7 @@ def list_pending_tasks(
             result_lines.append(line)
         
         result = "\n".join(result_lines)
-        result += f"\n\n(表示: {offset + 1}〜{offset + len(tasks)}件)"
+        result += f"\n\n(表示: {offset + 1}〜{offset + len(tasks)}件 / 全{total_count}件)"
         
         return result
         
@@ -1383,45 +1418,42 @@ def update_task_date(
         return t('error.invalid_id')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの存在確認と変更前の値を取得
-        cursor.execute('SELECT due_date FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            conn.close()
-            return t('task.not_found', task_id)
-        
-        old_due_date = row[0]
-        
-        # 過去日付の警告
-        warning = ""
-        try:
-            from datetime import datetime
-            new_date = datetime.strptime(new_due_date, '%Y-%m-%d')
-            today = datetime.now().date()
-            if new_date.date() < today:
-                warning = f"\n{t('task.due_date_past_warning')}"
-        except ValueError:
-            conn.close()
-            return t('error.invalid_date')
-        
-        # 期日の更新
-        cursor.execute('''
-            UPDATE tasks SET due_date = ?, updated_at = datetime('now')
-            WHERE id = ?
-        ''', (new_due_date, task_id))
-        
-        # 変更履歴の記録
-        cursor.execute('''
-            INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
-            VALUES (?, 'due_date', ?, ?, ?, datetime('now'), 'ai')
-        ''', (task_id, old_due_date, new_due_date, reason))
-        
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの存在確認と変更前の値を取得
+            cursor.execute('SELECT due_date FROM tasks WHERE id = ?', (task_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return t('task.not_found', task_id)
+            
+            old_due_date = row[0]
+            
+            # 過去日付の警告
+            warning = ""
+            try:
+                from datetime import datetime
+                new_date = datetime.strptime(new_due_date, '%Y-%m-%d')
+                today = datetime.now().date()
+                if new_date.date() < today:
+                    warning = f"\n{t('task.due_date_past_warning')}"
+            except ValueError:
+                return t('error.invalid_date')
+            
+            # 期日の更新
+            cursor.execute('''
+                UPDATE tasks SET due_date = ?, updated_at = datetime('now')
+                WHERE id = ?
+            ''', (new_due_date, task_id))
+            
+            # 変更履歴の記録
+            cursor.execute('''
+                INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
+                VALUES (?, 'due_date', ?, ?, ?, datetime('now'), 'ai')
+            ''', (task_id, old_due_date, new_due_date, reason))
+            
+            conn.commit()
         
         logger.info(f"タスク #{task_id} の期日を {old_due_date} から {new_due_date} に変更しました")
         
@@ -1469,33 +1501,31 @@ def update_task_title(
         return t('error.empty_title')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの存在確認と変更前の値を取得
-        cursor.execute('SELECT title FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            conn.close()
-            return t('task.not_found', task_id)
-        
-        old_title = row[0]
-        
-        # タイトルの更新
-        cursor.execute('''
-            UPDATE tasks SET title = ?, updated_at = datetime('now')
-            WHERE id = ?
-        ''', (new_title.strip(), task_id))
-        
-        # 変更履歴の記録
-        cursor.execute('''
-            INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
-            VALUES (?, 'title', ?, ?, ?, datetime('now'), 'ai')
-        ''', (task_id, old_title, new_title.strip(), reason))
-        
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの存在確認と変更前の値を取得
+            cursor.execute('SELECT title FROM tasks WHERE id = ?', (task_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return t('task.not_found', task_id)
+            
+            old_title = row[0]
+            
+            # タイトルの更新
+            cursor.execute('''
+                UPDATE tasks SET title = ?, updated_at = datetime('now')
+                WHERE id = ?
+            ''', (new_title.strip(), task_id))
+            
+            # 変更履歴の記録
+            cursor.execute('''
+                INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
+                VALUES (?, 'title', ?, ?, ?, datetime('now'), 'ai')
+            ''', (task_id, old_title, new_title.strip(), reason))
+            
+            conn.commit()
         
         logger.info(f"タスク #{task_id} のタイトルを '{old_title}' から '{new_title}' に変更しました")
         
@@ -1537,33 +1567,31 @@ def update_task_description(
         return t('error.invalid_id')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの存在確認と変更前の値を取得
-        cursor.execute('SELECT description FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            conn.close()
-            return t('task.not_found', task_id)
-        
-        old_description = row[0] if row[0] else ""
-        
-        # 説明の更新
-        cursor.execute('''
-            UPDATE tasks SET description = ?, updated_at = datetime('now')
-            WHERE id = ?
-        ''', (new_description, task_id))
-        
-        # 変更履歴の記録
-        cursor.execute('''
-            INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
-            VALUES (?, 'description', ?, ?, ?, datetime('now'), 'ai')
-        ''', (task_id, old_description, new_description, reason))
-        
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの存在確認と変更前の値を取得
+            cursor.execute('SELECT description FROM tasks WHERE id = ?', (task_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return t('task.not_found', task_id)
+            
+            old_description = row[0] if row[0] else ""
+            
+            # 説明の更新
+            cursor.execute('''
+                UPDATE tasks SET description = ?, updated_at = datetime('now')
+                WHERE id = ?
+            ''', (new_description, task_id))
+            
+            # 変更履歴の記録
+            cursor.execute('''
+                INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
+                VALUES (?, 'description', ?, ?, ?, datetime('now'), 'ai')
+            ''', (task_id, old_description, new_description, reason))
+            
+            conn.commit()
         
         logger.info(f"タスク #{task_id} の説明を更新しました")
         
@@ -1610,33 +1638,31 @@ def update_task_priority(
         return t('error.invalid_priority')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの存在確認と変更前の値を取得
-        cursor.execute('SELECT priority FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            conn.close()
-            return t('task.not_found', task_id)
-        
-        old_priority = row[0]
-        
-        # 優先度の更新
-        cursor.execute('''
-            UPDATE tasks SET priority = ?, updated_at = datetime('now')
-            WHERE id = ?
-        ''', (priority, task_id))
-        
-        # 変更履歴の記録
-        cursor.execute('''
-            INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
-            VALUES (?, 'priority', ?, ?, ?, datetime('now'), 'ai')
-        ''', (task_id, old_priority, priority, reason))
-        
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの存在確認と変更前の値を取得
+            cursor.execute('SELECT priority FROM tasks WHERE id = ?', (task_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return t('task.not_found', task_id)
+            
+            old_priority = row[0]
+            
+            # 優先度の更新
+            cursor.execute('''
+                UPDATE tasks SET priority = ?, updated_at = datetime('now')
+                WHERE id = ?
+            ''', (priority, task_id))
+            
+            # 変更履歴の記録
+            cursor.execute('''
+                INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
+                VALUES (?, 'priority', ?, ?, ?, datetime('now'), 'ai')
+            ''', (task_id, old_priority, priority, reason))
+            
+            conn.commit()
         
         logger.info(f"タスク #{task_id} の優先度を '{old_priority}' から '{priority}' に変更しました")
         
@@ -1678,33 +1704,31 @@ def update_task_category(
         return t('error.invalid_id')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの存在確認と変更前の値を取得
-        cursor.execute('SELECT category FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            conn.close()
-            return t('task.not_found', task_id)
-        
-        old_category = row[0] if row[0] else ""
-        
-        # カテゴリの更新
-        cursor.execute('''
-            UPDATE tasks SET category = ?, updated_at = datetime('now')
-            WHERE id = ?
-        ''', (category, task_id))
-        
-        # 変更履歴の記録
-        cursor.execute('''
-            INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
-            VALUES (?, 'category', ?, ?, ?, datetime('now'), 'ai')
-        ''', (task_id, old_category, category, reason))
-        
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの存在確認と変更前の値を取得
+            cursor.execute('SELECT category FROM tasks WHERE id = ?', (task_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return t('task.not_found', task_id)
+            
+            old_category = row[0] if row[0] else ""
+            
+            # カテゴリの更新
+            cursor.execute('''
+                UPDATE tasks SET category = ?, updated_at = datetime('now')
+                WHERE id = ?
+            ''', (category, task_id))
+            
+            # 変更履歴の記録
+            cursor.execute('''
+                INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
+                VALUES (?, 'category', ?, ?, ?, datetime('now'), 'ai')
+            ''', (task_id, old_category, category, reason))
+            
+            conn.commit()
         
         logger.info(f"タスク #{task_id} のカテゴリを '{old_category}' から '{category}' に変更しました")
         
@@ -1755,33 +1779,31 @@ def update_task_status(
         return t('error.invalid_status')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの存在確認と変更前の値を取得
-        cursor.execute('SELECT status FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            conn.close()
-            return t('task.not_found', task_id)
-        
-        old_status = row[0]
-        
-        # ステータスの更新
-        cursor.execute('''
-            UPDATE tasks SET status = ?, updated_at = datetime('now')
-            WHERE id = ?
-        ''', (status, task_id))
-        
-        # 変更履歴の記録
-        cursor.execute('''
-            INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
-            VALUES (?, 'status', ?, ?, ?, datetime('now'), 'ai')
-        ''', (task_id, old_status, status, reason))
-        
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの存在確認と変更前の値を取得
+            cursor.execute('SELECT status FROM tasks WHERE id = ?', (task_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return t('task.not_found', task_id)
+            
+            old_status = row[0]
+            
+            # ステータスの更新
+            cursor.execute('''
+                UPDATE tasks SET status = ?, updated_at = datetime('now')
+                WHERE id = ?
+            ''', (status, task_id))
+            
+            # 変更履歴の記録
+            cursor.execute('''
+                INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
+                VALUES (?, 'status', ?, ?, ?, datetime('now'), 'ai')
+            ''', (task_id, old_status, status, reason))
+            
+            conn.commit()
         
         logger.info(f"タスク #{task_id} のステータスを '{old_status}' から '{status}' に変更しました")
         
@@ -1823,38 +1845,35 @@ def complete_task(
         return t('error.invalid_id')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの存在確認と現在のステータスを取得
-        cursor.execute('SELECT status FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            conn.close()
-            return t('task.not_found', task_id)
-        
-        current_status = row[0]
-        
-        # 既に完了している場合
-        if current_status == 'completed':
-            conn.close()
-            return t('task.already_completed', task_id)
-        
-        # ステータスを完了に更新
-        cursor.execute('''
-            UPDATE tasks SET status = 'completed', updated_at = datetime('now'), completed_at = datetime('now')
-            WHERE id = ?
-        ''', (task_id,))
-        
-        # 変更履歴の記録
-        cursor.execute('''
-            INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
-            VALUES (?, 'status', ?, 'completed', 'タスク完了', datetime('now'), 'ai')
-        ''', (task_id, current_status))
-        
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの存在確認と現在のステータスを取得
+            cursor.execute('SELECT status FROM tasks WHERE id = ?', (task_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return t('task.not_found', task_id)
+            
+            current_status = row[0]
+            
+            # 既に完了している場合
+            if current_status == 'completed':
+                return t('task.already_completed', task_id)
+            
+            # ステータスを完了に更新
+            cursor.execute('''
+                UPDATE tasks SET status = 'completed', updated_at = datetime('now'), completed_at = datetime('now')
+                WHERE id = ?
+            ''', (task_id,))
+            
+            # 変更履歴の記録
+            cursor.execute('''
+                INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
+                VALUES (?, 'status', ?, 'completed', 'タスク完了', datetime('now'), 'ai')
+            ''', (task_id, current_status))
+            
+            conn.commit()
         
         logger.info(f"タスク #{task_id} を完了状態に変更しました")
         
@@ -1898,33 +1917,31 @@ def archive_task(
         return t('error.invalid_id')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの存在確認と現在のステータスを取得
-        cursor.execute('SELECT status FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            conn.close()
-            return t('task.not_found', task_id)
-        
-        current_status = row[0]
-        
-        # ステータスをアーカイブに更新
-        cursor.execute('''
-            UPDATE tasks SET status = 'archived', updated_at = datetime('now')
-            WHERE id = ?
-        ''', (task_id,))
-        
-        # 変更履歴の記録
-        cursor.execute('''
-            INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
-            VALUES (?, 'status', ?, 'archived', ?, datetime('now'), 'ai')
-        ''', (task_id, current_status, reason))
-        
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの存在確認と現在のステータスを取得
+            cursor.execute('SELECT status FROM tasks WHERE id = ?', (task_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return t('task.not_found', task_id)
+            
+            current_status = row[0]
+            
+            # ステータスをアーカイブに更新
+            cursor.execute('''
+                UPDATE tasks SET status = 'archived', updated_at = datetime('now')
+                WHERE id = ?
+            ''', (task_id,))
+            
+            # 変更履歴の記録
+            cursor.execute('''
+                INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
+                VALUES (?, 'status', ?, 'archived', ?, datetime('now'), 'ai')
+            ''', (task_id, current_status, reason))
+            
+            conn.commit()
         
         logger.info(f"タスク #{task_id} をアーカイブしました")
         
@@ -1962,38 +1979,35 @@ def restore_task(
         return t('error.invalid_id')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの存在確認と現在のステータスを取得
-        cursor.execute('SELECT status FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            conn.close()
-            return t('task.not_found', task_id)
-        
-        current_status = row[0]
-        
-        # アーカイブされていない場合
-        if current_status != 'archived':
-            conn.close()
-            return t('task.not_archived', task_id)
-        
-        # ステータスをpendingに復元
-        cursor.execute('''
-            UPDATE tasks SET status = 'pending', updated_at = datetime('now')
-            WHERE id = ?
-        ''', (task_id,))
-        
-        # 変更履歴の記録
-        cursor.execute('''
-            INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
-            VALUES (?, 'status', 'archived', 'pending', 'タスク復元', datetime('now'), 'ai')
-        ''', (task_id,))
-        
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの存在確認と現在のステータスを取得
+            cursor.execute('SELECT status FROM tasks WHERE id = ?', (task_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return t('task.not_found', task_id)
+            
+            current_status = row[0]
+            
+            # アーカイブされていない場合
+            if current_status != 'archived':
+                return t('task.not_archived', task_id)
+            
+            # ステータスをpendingに復元
+            cursor.execute('''
+                UPDATE tasks SET status = 'pending', updated_at = datetime('now')
+                WHERE id = ?
+            ''', (task_id,))
+            
+            # 変更履歴の記録
+            cursor.execute('''
+                INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
+                VALUES (?, 'status', 'archived', 'pending', 'タスク復元', datetime('now'), 'ai')
+            ''', (task_id,))
+            
+            conn.commit()
         
         logger.info(f"タスク #{task_id} を復元しました")
         
@@ -2035,27 +2049,28 @@ def delete_task(
         return t('error.invalid_id')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの存在確認とタイトルを取得
-        cursor.execute('SELECT id, title FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        
-        if not row:
-            conn.close()
-            return t('task.not_found', task_id)
-        
-        task_title = row[1]
-        
-        # 関連する変更履歴の削除
-        cursor.execute('DELETE FROM task_history WHERE task_id = ?', (task_id,))
-        
-        # タスクの削除
-        cursor.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
-        
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの存在確認とタイトルを取得
+            cursor.execute('SELECT id, title FROM tasks WHERE id = ?', (task_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return t('task.not_found', task_id)
+            
+            task_title = row[1]
+            
+            # 関連する変更履歴の削除
+            cursor.execute('DELETE FROM task_history WHERE task_id = ?', (task_id,))
+            
+            # エンベディングの削除
+            cursor.execute('DELETE FROM task_embeddings WHERE task_id = ?', (task_id,))
+            
+            # タスクの削除
+            cursor.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
+            
+            conn.commit()
         
         logger.info(f"タスク #{task_id} '{task_title}' を削除しました")
         
@@ -2090,25 +2105,23 @@ def get_task_history(
         return t('error.invalid_id')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # タスクの存在確認
-        cursor.execute('SELECT id FROM tasks WHERE id = ?', (task_id,))
-        if not cursor.fetchone():
-            conn.close()
-            return t('task.not_found', task_id)
-        
-        # 変更履歴の取得（日時の降順）
-        cursor.execute('''
-            SELECT field_name, old_value, new_value, reason, changed_at, changed_by
-            FROM task_history
-            WHERE task_id = ?
-            ORDER BY changed_at DESC
-        ''', (task_id,))
-        
-        history = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # タスクの存在確認
+            cursor.execute('SELECT id FROM tasks WHERE id = ?', (task_id,))
+            if not cursor.fetchone():
+                return t('task.not_found', task_id)
+            
+            # 変更履歴の取得（日時の降順）
+            cursor.execute('''
+                SELECT field_name, old_value, new_value, reason, changed_at, changed_by
+                FROM task_history
+                WHERE task_id = ?
+                ORDER BY changed_at DESC
+            ''', (task_id,))
+            
+            history = cursor.fetchall()
         
         if not history:
             return t('task.history_empty', task_id)
@@ -2164,20 +2177,19 @@ def search_tasks(
         return "検索キーワードを指定してください。"
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # LIKE検索（部分一致）
-        search_pattern = f"%{keyword.strip()}%"
-        cursor.execute('''
-            SELECT id, title, due_date, status
-            FROM tasks
-            WHERE title LIKE ? OR description LIKE ?
-            ORDER BY created_at DESC
-        ''', (search_pattern, search_pattern))
-        
-        tasks = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # LIKE検索（部分一致）
+            search_pattern = f"%{keyword.strip()}%"
+            cursor.execute('''
+                SELECT id, title, due_date, status
+                FROM tasks
+                WHERE title LIKE ? OR description LIKE ?
+                ORDER BY created_at DESC
+            ''', (search_pattern, search_pattern))
+            
+            tasks = cursor.fetchall()
         
         if not tasks:
             return t('search.no_results', keyword)
@@ -2224,18 +2236,21 @@ def list_all_tasks(
     offset = max(0, offset)
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, title, due_date, status, priority, category
-            FROM tasks
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
-        ''', (limit, offset))
-        
-        tasks = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # 総件数を取得
+            cursor.execute('SELECT COUNT(*) FROM tasks')
+            total_count = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT id, title, due_date, status, priority, category
+                FROM tasks
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+            ''', (limit, offset))
+            
+            tasks = cursor.fetchall()
         
         if not tasks:
             return t('task.no_tasks')
@@ -2252,7 +2267,7 @@ def list_all_tasks(
             result_lines.append(line)
         
         result = "\n".join(result_lines)
-        result += f"\n\n(表示: {offset + 1}〜{offset + len(tasks)}件)"
+        result += f"\n\n(表示: {offset + 1}〜{offset + len(tasks)}件 / 全{total_count}件)"
         
         return result
         
@@ -2388,26 +2403,25 @@ def store_task_embedding(task_id: int, embedding: List[float]) -> bool:
     import struct
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # エンベディングをバイナリに変換
-        embedding_blob = struct.pack(f'{len(embedding)}f', *embedding)
-        
-        api_config = get_embedding_api_client()
-        model_name = api_config.get('model', 'qwen3-embedding:0.6b')
-        
-        # 既存のエンベディングを削除
-        cursor.execute('DELETE FROM task_embeddings WHERE task_id = ?', (task_id,))
-        
-        # 新しいエンベディングを保存
-        cursor.execute('''
-            INSERT INTO task_embeddings (task_id, embedding, model_name, created_at)
-            VALUES (?, ?, ?, datetime('now'))
-        ''', (task_id, embedding_blob, model_name))
-        
-        conn.commit()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # エンベディングをバイナリに変換
+            embedding_blob = struct.pack(f'{len(embedding)}f', *embedding)
+            
+            api_config = get_embedding_api_client()
+            model_name = api_config.get('model', 'qwen3-embedding:0.6b')
+            
+            # 既存のエンベディングを削除
+            cursor.execute('DELETE FROM task_embeddings WHERE task_id = ?', (task_id,))
+            
+            # 新しいエンベディングを保存
+            cursor.execute('''
+                INSERT INTO task_embeddings (task_id, embedding, model_name, created_at)
+                VALUES (?, ?, ?, datetime('now'))
+            ''', (task_id, embedding_blob, model_name))
+            
+            conn.commit()
         
         return True
         
@@ -2428,12 +2442,11 @@ def get_task_embedding(task_id: int) -> Optional[List[float]]:
     import struct
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT embedding FROM task_embeddings WHERE task_id = ?', (task_id,))
-        row = cursor.fetchone()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT embedding FROM task_embeddings WHERE task_id = ?', (task_id,))
+            row = cursor.fetchone()
         
         if row and row[0]:
             # バイナリからエンベディングを復元
@@ -2479,100 +2492,126 @@ def search_tasks_advanced(query: dict) -> str:
     logger = get_logger()
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # SQLクエリの構築
-        sql = "SELECT id, title, due_date, status, priority, category FROM tasks WHERE 1=1"
-        params = []
-        
-        # キーワード検索
-        keyword = query.get('keyword')
-        if keyword:
-            sql += " AND (title LIKE ? OR description LIKE ?)"
-            search_pattern = f"%{keyword.strip()}%"
-            params.extend([search_pattern, search_pattern])
-        
-        # ステータスフィルタ
-        status = query.get('status')
-        if status:
-            if isinstance(status, list):
-                placeholders = ','.join(['?' for _ in status])
-                sql += f" AND status IN ({placeholders})"
-                params.extend(status)
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # SQLクエリの構築
+            sql = "SELECT id, title, due_date, status, priority, category FROM tasks WHERE 1=1"
+            count_sql = "SELECT COUNT(*) FROM tasks WHERE 1=1"
+            params = []
+            count_params = []
+            
+            # キーワード検索
+            keyword = query.get('keyword')
+            if keyword:
+                sql += " AND (title LIKE ? OR description LIKE ?)"
+                count_sql += " AND (title LIKE ? OR description LIKE ?)"
+                search_pattern = f"%{keyword.strip()}%"
+                params.extend([search_pattern, search_pattern])
+                count_params.extend([search_pattern, search_pattern])
+            
+            # ステータスフィルタ
+            status = query.get('status')
+            if status:
+                if isinstance(status, list):
+                    placeholders = ','.join(['?' for _ in status])
+                    sql += f" AND status IN ({placeholders})"
+                    count_sql += f" AND status IN ({placeholders})"
+                    params.extend(status)
+                    count_params.extend(status)
+                else:
+                    sql += " AND status = ?"
+                    count_sql += " AND status = ?"
+                    params.append(status)
+                    count_params.append(status)
+            
+            # 優先度フィルタ
+            priority = query.get('priority')
+            if priority:
+                if isinstance(priority, list):
+                    placeholders = ','.join(['?' for _ in priority])
+                    sql += f" AND priority IN ({placeholders})"
+                    count_sql += f" AND priority IN ({placeholders})"
+                    params.extend(priority)
+                    count_params.extend(priority)
+                else:
+                    sql += " AND priority = ?"
+                    count_sql += " AND priority = ?"
+                    params.append(priority)
+                    count_params.append(priority)
+            
+            # カテゴリフィルタ
+            category = query.get('category')
+            if category:
+                sql += " AND category = ?"
+                count_sql += " AND category = ?"
+                params.append(category)
+                count_params.append(category)
+            
+            # 期日範囲フィルタ
+            due_date_from = query.get('due_date_from')
+            if due_date_from:
+                sql += " AND due_date >= ?"
+                count_sql += " AND due_date >= ?"
+                params.append(due_date_from)
+                count_params.append(due_date_from)
+            
+            due_date_to = query.get('due_date_to')
+            if due_date_to:
+                sql += " AND due_date <= ?"
+                count_sql += " AND due_date <= ?"
+                params.append(due_date_to)
+                count_params.append(due_date_to)
+            
+            # 登録日時範囲フィルタ
+            created_from = query.get('created_from')
+            if created_from:
+                sql += " AND created_at >= ?"
+                count_sql += " AND created_at >= ?"
+                params.append(f"{created_from} 00:00:00")
+                count_params.append(f"{created_from} 00:00:00")
+            
+            created_to = query.get('created_to')
+            if created_to:
+                sql += " AND created_at <= ?"
+                count_sql += " AND created_at <= ?"
+                params.append(f"{created_to} 23:59:59")
+                count_params.append(f"{created_to} 23:59:59")
+            
+            # 期限切れフィルタ
+            overdue = query.get('overdue')
+            if overdue:
+                sql += " AND due_date < date('now') AND status = 'pending'"
+                count_sql += " AND due_date < date('now') AND status = 'pending'"
+            
+            # 総件数を取得
+            cursor.execute(count_sql, count_params)
+            total_count = cursor.fetchone()[0]
+            
+            # ソート
+            sort_by = query.get('sort_by', 'due_date')
+            valid_sort_fields = {'due_date': 'due_date', 'created_at': 'created_at', 'priority': 'priority'}
+            sort_field = valid_sort_fields.get(sort_by, 'due_date')
+            
+            # 優先度のソート順（high > medium > low）
+            if sort_field == 'priority':
+                sort_order = query.get('sort_order', 'asc')
+                if sort_order == 'desc':
+                    sql += " ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END DESC"
+                else:
+                    sql += " ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END ASC"
             else:
-                sql += " AND status = ?"
-                params.append(status)
-        
-        # 優先度フィルタ
-        priority = query.get('priority')
-        if priority:
-            if isinstance(priority, list):
-                placeholders = ','.join(['?' for _ in priority])
-                sql += f" AND priority IN ({placeholders})"
-                params.extend(priority)
-            else:
-                sql += " AND priority = ?"
-                params.append(priority)
-        
-        # カテゴリフィルタ
-        category = query.get('category')
-        if category:
-            sql += " AND category = ?"
-            params.append(category)
-        
-        # 期日範囲フィルタ
-        due_date_from = query.get('due_date_from')
-        if due_date_from:
-            sql += " AND due_date >= ?"
-            params.append(due_date_from)
-        
-        due_date_to = query.get('due_date_to')
-        if due_date_to:
-            sql += " AND due_date <= ?"
-            params.append(due_date_to)
-        
-        # 登録日時範囲フィルタ
-        created_from = query.get('created_from')
-        if created_from:
-            sql += " AND created_at >= ?"
-            params.append(f"{created_from} 00:00:00")
-        
-        created_to = query.get('created_to')
-        if created_to:
-            sql += " AND created_at <= ?"
-            params.append(f"{created_to} 23:59:59")
-        
-        # 期限切れフィルタ
-        overdue = query.get('overdue')
-        if overdue:
-            sql += " AND due_date < date('now') AND status = 'pending'"
-        
-        # ソート
-        sort_by = query.get('sort_by', 'due_date')
-        valid_sort_fields = {'due_date': 'due_date', 'created_at': 'created_at', 'priority': 'priority'}
-        sort_field = valid_sort_fields.get(sort_by, 'due_date')
-        
-        # 優先度のソート順（high > medium > low）
-        if sort_field == 'priority':
-            sort_order = query.get('sort_order', 'asc')
-            if sort_order == 'desc':
-                sql += " ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END DESC"
-            else:
-                sql += " ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END ASC"
-        else:
-            sort_order = query.get('sort_order', 'asc')
-            order = 'DESC' if sort_order == 'desc' else 'ASC'
-            sql += f" ORDER BY {sort_field} {order}"
-        
-        # リミット
-        limit = min(max(1, query.get('limit', 100)), 1000)
-        sql += " LIMIT ?"
-        params.append(limit)
-        
-        cursor.execute(sql, params)
-        tasks = cursor.fetchall()
-        conn.close()
+                sort_order = query.get('sort_order', 'asc')
+                order = 'DESC' if sort_order == 'desc' else 'ASC'
+                sql += f" ORDER BY {sort_field} {order}"
+            
+            # リミット
+            limit = min(max(1, query.get('limit', 100)), 1000)
+            sql += " LIMIT ?"
+            params.append(limit)
+            
+            cursor.execute(sql, params)
+            tasks = cursor.fetchall()
         
         if not tasks:
             return t('search.no_advanced_results')
@@ -2588,7 +2627,7 @@ def search_tasks_advanced(query: dict) -> str:
             line += ")"
             result_lines.append(line)
         
-        result_lines.append(f"\n(検索結果: {len(tasks)}件)")
+        result_lines.append(f"\n(検索結果: {len(tasks)}件 / 全{total_count}件)")
         
         return "\n".join(result_lines)
         
@@ -2610,20 +2649,19 @@ def get_overdue_tasks() -> str:
     logger = get_logger()
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        today = datetime.now().date()
-        
-        cursor.execute('''
-            SELECT id, title, due_date, priority, category
-            FROM tasks
-            WHERE status = 'pending' AND due_date < date('now')
-            ORDER BY due_date ASC
-        ''')
-        
-        tasks = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            today = datetime.now().date()
+            
+            cursor.execute('''
+                SELECT id, title, due_date, priority, category
+                FROM tasks
+                WHERE status = 'pending' AND due_date < date('now')
+                ORDER BY due_date ASC
+            ''')
+            
+            tasks = cursor.fetchall()
         
         if not tasks:
             return t('task.no_overdue')
@@ -2684,31 +2722,30 @@ def get_tasks_by_date_range(date_type: str, date_from: str, date_to: str) -> str
         return t('error.invalid_date')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        if date_type == 'created':
-            sql = '''
-                SELECT id, title, due_date, status, created_at
-                FROM tasks
-                WHERE created_at >= ? AND created_at <= ?
-                ORDER BY created_at DESC
-            '''
-            params = [f"{date_from} 00:00:00", f"{date_to} 23:59:59"]
-            date_label = "登録日"
-        else:
-            sql = '''
-                SELECT id, title, due_date, status
-                FROM tasks
-                WHERE due_date >= ? AND due_date <= ?
-                ORDER BY due_date ASC
-            '''
-            params = [date_from, date_to]
-            date_label = "期日"
-        
-        cursor.execute(sql, params)
-        tasks = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            if date_type == 'created':
+                sql = '''
+                    SELECT id, title, due_date, status, created_at
+                    FROM tasks
+                    WHERE created_at >= ? AND created_at <= ?
+                    ORDER BY created_at DESC
+                '''
+                params = [f"{date_from} 00:00:00", f"{date_to} 23:59:59"]
+                date_label = "登録日"
+            else:
+                sql = '''
+                    SELECT id, title, due_date, status
+                    FROM tasks
+                    WHERE due_date >= ? AND due_date <= ?
+                    ORDER BY due_date ASC
+                '''
+                params = [date_from, date_to]
+                date_label = "期日"
+            
+            cursor.execute(sql, params)
+            tasks = cursor.fetchall()
         
         if not tasks:
             return f"指定期間（{date_from} 〜 {date_to}）にタスクはありません。"
@@ -2743,55 +2780,53 @@ def get_task_statistics() -> str:
     logger = get_logger()
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # 総タスク数
-        cursor.execute('SELECT COUNT(*) FROM tasks')
-        total = cursor.fetchone()[0]
-        
-        # ステータス別の集計
-        cursor.execute('SELECT status, COUNT(*) FROM tasks GROUP BY status')
-        status_rows = cursor.fetchall()
-        by_status = {row[0]: row[1] for row in status_rows}
-        
-        # 優先度別の集計（未完了タスクのみ）
-        cursor.execute('''
-            SELECT priority, COUNT(*)
-            FROM tasks
-            WHERE status = 'pending'
-            GROUP BY priority
-        ''')
-        priority_rows = cursor.fetchall()
-        by_priority = {row[0]: row[1] for row in priority_rows}
-        
-        # 期限切れタスク数
-        cursor.execute('''
-            SELECT COUNT(*)
-            FROM tasks
-            WHERE status = 'pending' AND due_date < date('now')
-        ''')
-        overdue_count = cursor.fetchone()[0]
-        
-        # 今日が期日のタスク数
-        cursor.execute('''
-            SELECT COUNT(*)
-            FROM tasks
-            WHERE status = 'pending' AND due_date = date('now')
-        ''')
-        upcoming_today = cursor.fetchone()[0]
-        
-        # 今週が期日のタスク数（今日から7日以内）
-        cursor.execute('''
-            SELECT COUNT(*)
-            FROM tasks
-            WHERE status = 'pending'
-            AND due_date >= date('now')
-            AND due_date <= date('now', '+7 days')
-        ''')
-        upcoming_week = cursor.fetchone()[0]
-        
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # 総タスク数
+            cursor.execute('SELECT COUNT(*) FROM tasks')
+            total = cursor.fetchone()[0]
+            
+            # ステータス別の集計
+            cursor.execute('SELECT status, COUNT(*) FROM tasks GROUP BY status')
+            status_rows = cursor.fetchall()
+            by_status = {row[0]: row[1] for row in status_rows}
+            
+            # 優先度別の集計（未完了タスクのみ）
+            cursor.execute('''
+                SELECT priority, COUNT(*)
+                FROM tasks
+                WHERE status = 'pending'
+                GROUP BY priority
+            ''')
+            priority_rows = cursor.fetchall()
+            by_priority = {row[0]: row[1] for row in priority_rows}
+            
+            # 期限切れタスク数
+            cursor.execute('''
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE status = 'pending' AND due_date < date('now')
+            ''')
+            overdue_count = cursor.fetchone()[0]
+            
+            # 今日が期日のタスク数
+            cursor.execute('''
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE status = 'pending' AND due_date = date('now')
+            ''')
+            upcoming_today = cursor.fetchone()[0]
+            
+            # 今週が期日のタスク数（今日から7日以内）
+            cursor.execute('''
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE status = 'pending'
+                AND due_date >= date('now')
+                AND due_date <= date('now', '+7 days')
+            ''')
+            upcoming_week = cursor.fetchone()[0]
         
         # 統計情報をJSON形式で返す
         stats = {
@@ -2837,18 +2872,17 @@ def get_recent_tasks(days: int = 7) -> str:
     days = max(1, min(days, 365))
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, title, due_date, status, created_at
-            FROM tasks
-            WHERE created_at >= datetime('now', '-' || ? || ' days')
-            ORDER BY created_at DESC
-        ''', (days,))
-        
-        tasks = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT id, title, due_date, status, created_at
+                FROM tasks
+                WHERE created_at >= datetime('now', '-' || ? || ' days')
+                ORDER BY created_at DESC
+            ''', (days,))
+            
+            tasks = cursor.fetchall()
         
         if not tasks:
             return t('task.no_recent', days)
@@ -2903,18 +2937,18 @@ def semantic_search_tasks(query: str, limit: int = 10, use_embedding: bool = Tru
                 logger.debug(t('embedding.mode_embedding', api_config['model']))
                 
                 try:
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    
-                    # 全タスクのエンベディングを取得
-                    cursor.execute('''
-                        SELECT t.id, t.title, t.due_date, t.status, e.embedding
-                        FROM tasks t
-                        LEFT JOIN task_embeddings e ON t.id = e.task_id
-                    ''')
-                    
-                    tasks_with_embeddings = cursor.fetchall()
-                    conn.close()
+                    with ConnectionContext() as conn:
+                        cursor = conn.cursor()
+                        
+                        # エンベディングがあるタスクのみを取得（全件スキャンを回避）
+                        cursor.execute('''
+                            SELECT t.id, t.title, t.due_date, t.status, e.embedding
+                            FROM task_embeddings e
+                            JOIN tasks t ON t.id = e.task_id
+                            LIMIT 10000
+                        ''')
+                        
+                        tasks_with_embeddings = cursor.fetchall()
                     
                     # 類似度を計算してソート
                     results = []
@@ -2974,19 +3008,19 @@ def rebuild_embeddings() -> str:
     logger = get_logger()
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # 全タスクを取得
-        cursor.execute('SELECT id, title, description FROM tasks')
-        tasks = cursor.fetchall()
-        
-        if not tasks:
-            conn.close()
-            return "エンベディングを再構築するタスクがありません。"
-        
-        # task_embeddingsテーブルをクリア
-        cursor.execute('DELETE FROM task_embeddings')
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # 全タスクを取得
+            cursor.execute('SELECT id, title, description FROM tasks')
+            tasks = cursor.fetchall()
+            
+            if not tasks:
+                return "エンベディングを再構築するタスクがありません。"
+            
+            # task_embeddingsテーブルをクリア
+            cursor.execute('DELETE FROM task_embeddings')
+            conn.commit()
         
         success_count = 0
         failed_count = 0
@@ -3003,8 +3037,6 @@ def rebuild_embeddings() -> str:
                     failed_count += 1
             else:
                 failed_count += 1
-        
-        conn.close()
         
         if failed_count > 0:
             return f"{success_count}件のタスクのエンベディングを再構築しました。（{failed_count}件は失敗）"
@@ -3034,19 +3066,18 @@ def get_completed_tasks(days: int = 30) -> str:
     days = max(1, min(days, 365))
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, title, due_date, completed_at
-            FROM tasks
-            WHERE status = 'completed'
-            AND completed_at >= datetime('now', '-' || ? || ' days')
-            ORDER BY completed_at DESC
-        ''', (days,))
-        
-        tasks = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT id, title, due_date, completed_at
+                FROM tasks
+                WHERE status = 'completed'
+                AND completed_at >= datetime('now', '-' || ? || ' days')
+                ORDER BY completed_at DESC
+            ''', (days,))
+            
+            tasks = cursor.fetchall()
         
         if not tasks:
             return t('task.no_completed', days)
@@ -3083,18 +3114,17 @@ def get_recently_modified_tasks(days: int = 7) -> str:
     days = max(1, min(days, 365))
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, title, status, updated_at
-            FROM tasks
-            WHERE updated_at >= datetime('now', '-' || ? || ' days')
-            ORDER BY updated_at DESC
-        ''', (days,))
-        
-        tasks = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT id, title, status, updated_at
+                FROM tasks
+                WHERE updated_at >= datetime('now', '-' || ? || ' days')
+                ORDER BY updated_at DESC
+            ''', (days,))
+            
+            tasks = cursor.fetchall()
         
         if not tasks:
             return t('task.no_modified', days)
@@ -3137,24 +3167,24 @@ def fuzzy_search_tasks(keyword: str, limit: int = 10) -> str:
     limit = max(1, min(limit, 100))
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # FTS5特殊文字をエスケープ
-        escaped_keyword = keyword.strip().replace('"', '""')
-        
-        # FTS5全文検索（BM25スコア順）
-        cursor.execute('''
-            SELECT t.id, t.title, t.due_date, t.status, bm25(tasks_fts) as score
-            FROM tasks t
-            JOIN tasks_fts fts ON t.id = fts.id
-            WHERE tasks_fts MATCH ?
-            ORDER BY score
-            LIMIT ?
-        ''', (f'"{escaped_keyword}"', limit))
-        
-        tasks = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # FTS5特殊文字をエスケープ
+            escaped_keyword = keyword.strip().replace('"', '""')
+            
+            # FTS5全文検索（BM25スコア順）
+            # bm25()にはFTS5テーブル名そのものを指定（エイリアス不可）
+            cursor.execute('''
+                SELECT t.id, t.title, t.due_date, t.status, bm25(tasks_fts) as score
+                FROM tasks t
+                JOIN tasks_fts ON t.id = tasks_fts.rowid
+                WHERE tasks_fts MATCH ?
+                ORDER BY score
+                LIMIT ?
+            ''', (f'"{escaped_keyword}"', limit))
+            
+            tasks = cursor.fetchall()
         
         if not tasks:
             return f"キーワード '{keyword}' を含むタスクは見つかりませんでした。"
@@ -3203,22 +3233,21 @@ def search_tasks_by_content_fragments(fragments: list) -> str:
         return "有効なキーワードが含まれていません。"
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # FTS5 OR検索クエリを構築
-        or_query = " OR ".join([f'"{k.replace(chr(34), chr(34)+chr(34))}"' for k in keywords])
-        
-        # FTS5全文検索
-        cursor.execute('''
-            SELECT t.id, t.title, t.due_date, t.status
-            FROM tasks t
-            JOIN tasks_fts fts ON t.id = fts.id
-            WHERE tasks_fts MATCH ?
-        ''', (or_query,))
-        
-        tasks = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # FTS5 OR検索クエリを構築
+            or_query = " OR ".join([f'"{k.replace(chr(34), chr(34)+chr(34))}"' for k in keywords])
+            
+            # FTS5全文検索
+            cursor.execute('''
+                SELECT t.id, t.title, t.due_date, t.status
+                FROM tasks t
+                JOIN tasks_fts ON t.id = tasks_fts.rowid
+                WHERE tasks_fts MATCH ?
+            ''', (or_query,))
+            
+            tasks = cursor.fetchall()
         
         if not tasks:
             return t('search.no_fragments_results')
@@ -3286,13 +3315,12 @@ def get_all_unique_words() -> str:
     }
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # 全タスクのタイトルと説明を取得
-        cursor.execute('SELECT title, description FROM tasks')
-        tasks = cursor.fetchall()
-        conn.close()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
+            
+            # 全タスクのタイトルと説明を取得
+            cursor.execute('SELECT title, description FROM tasks')
+            tasks = cursor.fetchall()
         
         if not tasks:
             return "タスクが登録されていません。"
@@ -3381,41 +3409,40 @@ def delete_tasks_bulk(task_ids: list) -> str:
         return t('error.empty_task_list')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        deleted_ids = []
-        not_found_ids = []
-        failed_ids = []
-        
-        for task_id in valid_ids:
-            # タスクの存在確認とタイトルを取得
-            cursor.execute('SELECT id, title FROM tasks WHERE id = ?', (task_id,))
-            row = cursor.fetchone()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
             
-            if not row:
-                not_found_ids.append(task_id)
-                continue
+            deleted_ids = []
+            not_found_ids = []
+            failed_ids = []
             
-            try:
-                # 関連する変更履歴の削除
-                cursor.execute('DELETE FROM task_history WHERE task_id = ?', (task_id,))
+            for task_id in valid_ids:
+                # タスクの存在確認とタイトルを取得
+                cursor.execute('SELECT id, title FROM tasks WHERE id = ?', (task_id,))
+                row = cursor.fetchone()
                 
-                # エンベディングの削除
-                cursor.execute('DELETE FROM task_embeddings WHERE task_id = ?', (task_id,))
+                if not row:
+                    not_found_ids.append(task_id)
+                    continue
                 
-                # タスクの削除
-                cursor.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
-                
-                deleted_ids.append(task_id)
-                logger.debug(f"タスク #{task_id} を削除しました")
-                
-            except Exception as e:
-                failed_ids.append(task_id)
-                logger.warning(f"タスク #{task_id} の削除に失敗: {str(e)}")
-        
-        conn.commit()
-        conn.close()
+                try:
+                    # 関連する変更履歴の削除
+                    cursor.execute('DELETE FROM task_history WHERE task_id = ?', (task_id,))
+                    
+                    # エンベディングの削除
+                    cursor.execute('DELETE FROM task_embeddings WHERE task_id = ?', (task_id,))
+                    
+                    # タスクの削除
+                    cursor.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
+                    
+                    deleted_ids.append(task_id)
+                    logger.debug(f"タスク #{task_id} を削除しました")
+                    
+                except Exception as e:
+                    failed_ids.append(task_id)
+                    logger.warning(f"タスク #{task_id} の削除に失敗: {str(e)}")
+            
+            conn.commit()
         
         # 結果メッセージの構築
         result_parts = []
@@ -3471,51 +3498,50 @@ def update_tasks_status_bulk(task_ids: list, status: str, reason: str = None) ->
         return t('error.empty_task_list')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        updated_ids = []
-        not_found_ids = []
-        already_status_ids = []
-        
-        for task_id in valid_ids:
-            # タスクの存在確認と現在のステータスを取得
-            cursor.execute('SELECT id, status FROM tasks WHERE id = ?', (task_id,))
-            row = cursor.fetchone()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
             
-            if not row:
-                not_found_ids.append(task_id)
-                continue
+            updated_ids = []
+            not_found_ids = []
+            already_status_ids = []
             
-            current_status = row[1]
-            
-            # 既に同じステータスの場合はスキップ
-            if current_status == status:
-                already_status_ids.append(task_id)
-                continue
-            
-            # ステータスの更新
-            if status == 'completed':
+            for task_id in valid_ids:
+                # タスクの存在確認と現在のステータスを取得
+                cursor.execute('SELECT id, status FROM tasks WHERE id = ?', (task_id,))
+                row = cursor.fetchone()
+                
+                if not row:
+                    not_found_ids.append(task_id)
+                    continue
+                
+                current_status = row[1]
+                
+                # 既に同じステータスの場合はスキップ
+                if current_status == status:
+                    already_status_ids.append(task_id)
+                    continue
+                
+                # ステータスの更新
+                if status == 'completed':
+                    cursor.execute('''
+                        UPDATE tasks SET status = ?, updated_at = datetime('now'), completed_at = datetime('now')
+                        WHERE id = ?
+                    ''', (status, task_id))
+                else:
+                    cursor.execute('''
+                        UPDATE tasks SET status = ?, updated_at = datetime('now')
+                        WHERE id = ?
+                    ''', (status, task_id))
+                
+                # 変更履歴の記録
                 cursor.execute('''
-                    UPDATE tasks SET status = ?, updated_at = datetime('now'), completed_at = datetime('now')
-                    WHERE id = ?
-                ''', (status, task_id))
-            else:
-                cursor.execute('''
-                    UPDATE tasks SET status = ?, updated_at = datetime('now')
-                    WHERE id = ?
-                ''', (status, task_id))
+                    INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
+                    VALUES (?, 'status', ?, ?, ?, datetime('now'), 'ai')
+                ''', (task_id, current_status, status, reason))
+                
+                updated_ids.append(task_id)
             
-            # 変更履歴の記録
-            cursor.execute('''
-                INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
-                VALUES (?, 'status', ?, ?, ?, datetime('now'), 'ai')
-            ''', (task_id, current_status, status, reason))
-            
-            updated_ids.append(task_id)
-        
-        conn.commit()
-        conn.close()
+            conn.commit()
         
         # 結果メッセージの構築
         result_parts = []
@@ -3583,49 +3609,48 @@ def update_tasks_due_date_bulk(
         return t('error.empty_task_list')
     
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        updated_ids = []
-        not_found_ids = []
-        
-        # 過去日付の警告
-        warning = ""
-        try:
-            new_date = datetime.strptime(new_due_date, '%Y-%m-%d')
-            today = datetime.now().date()
-            if new_date.date() < today:
-                warning = f"\n{t('task.due_date_past_warning')}"
-        except ValueError:
-            pass
-        
-        for task_id in valid_ids:
-            # タスクの存在確認と変更前の期日を取得
-            cursor.execute('SELECT id, due_date FROM tasks WHERE id = ?', (task_id,))
-            row = cursor.fetchone()
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
             
-            if not row:
-                not_found_ids.append(task_id)
-                continue
+            updated_ids = []
+            not_found_ids = []
             
-            old_due_date = row[1]
+            # 過去日付の警告
+            warning = ""
+            try:
+                new_date = datetime.strptime(new_due_date, '%Y-%m-%d')
+                today = datetime.now().date()
+                if new_date.date() < today:
+                    warning = f"\n{t('task.due_date_past_warning')}"
+            except ValueError:
+                pass
             
-            # 期日の更新
-            cursor.execute('''
-                UPDATE tasks SET due_date = ?, updated_at = datetime('now')
-                WHERE id = ?
-            ''', (new_due_date, task_id))
+            for task_id in valid_ids:
+                # タスクの存在確認と変更前の期日を取得
+                cursor.execute('SELECT id, due_date FROM tasks WHERE id = ?', (task_id,))
+                row = cursor.fetchone()
+                
+                if not row:
+                    not_found_ids.append(task_id)
+                    continue
+                
+                old_due_date = row[1]
+                
+                # 期日の更新
+                cursor.execute('''
+                    UPDATE tasks SET due_date = ?, updated_at = datetime('now')
+                    WHERE id = ?
+                ''', (new_due_date, task_id))
+                
+                # 変更履歴の記録
+                cursor.execute('''
+                    INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
+                    VALUES (?, 'due_date', ?, ?, ?, datetime('now'), 'ai')
+                ''', (task_id, old_due_date, new_due_date, reason))
+                
+                updated_ids.append(task_id)
             
-            # 変更履歴の記録
-            cursor.execute('''
-                INSERT INTO task_history (task_id, field_name, old_value, new_value, reason, changed_at, changed_by)
-                VALUES (?, 'due_date', ?, ?, ?, datetime('now'), 'ai')
-            ''', (task_id, old_due_date, new_due_date, reason))
-            
-            updated_ids.append(task_id)
-        
-        conn.commit()
-        conn.close()
+            conn.commit()
         
         # 結果メッセージの構築
         result_parts = []
@@ -3672,8 +3697,8 @@ def add_tasks_bulk(
     失敗時: エラーメッセージ
 
     【注意点】
-    100件ごとにコミットを分割して実行し、トランザクション整合性を保証します。
-    エラー時は現在のバッチまでの変更をロールバックします。
+    各タスクの登録は個別に検証され、失敗したタスクはスキップされます。
+    成功したタスクのみがコミットされます。エラー時は全てロールバックされます。
     """
     logger = get_logger()
     
@@ -3688,69 +3713,71 @@ def add_tasks_bulk(
     added_ids = []
     failed_tasks = []
     
-    # 100件ごとにコミット
-    batch_size = 100
-    
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        for i, task in enumerate(tasks):
-            if not isinstance(task, dict):
-                failed_tasks.append((i, "タスク情報が辞書形式ではありません"))
-                continue
+        with ConnectionContext() as conn:
+            cursor = conn.cursor()
             
-            # タイトルの検証
-            title = task.get('title', '')
-            if not title or not str(title).strip():
-                failed_tasks.append((i, "タイトルが空です"))
-                continue
-            
-            title = str(title).strip()
-            description = task.get('description', '')
-            due_date = task.get('due_date')
-            priority = task.get('priority', 'medium')
-            category = task.get('category')
-            
-            # 期日の処理（未指定の場合は3営業日後）
-            auto_due = False
-            if not due_date or due_date == "" or str(due_date).lower() == "none":
-                due_date = get_3_business_days_later()
-                auto_due = True
-            else:
-                # 日付形式の検証
-                try:
-                    datetime.strptime(str(due_date), '%Y-%m-%d')
-                except ValueError:
-                    failed_tasks.append((i, f"期日の形式が不正です: {due_date}"))
-                    continue
-            
-            # 優先度の検証
-            if priority not in valid_priorities:
-                priority = 'medium'
+            # SAVEPOINTを設定して、エラー時に全てロールバックできるようにする
+            cursor.execute('SAVEPOINT bulk_insert_sp')
             
             try:
-                # タスクの登録
-                cursor.execute('''
-                    INSERT INTO tasks (title, description, due_date, status, priority, category, created_at)
-                    VALUES (?, ?, ?, 'pending', ?, ?, datetime('now'))
-                ''', (title, description, due_date, priority, category))
-                
-                task_id = cursor.lastrowid
-                added_ids.append(task_id)
-                
-                # 100件ごとにコミット
-                if len(added_ids) % batch_size == 0:
-                    conn.commit()
-                    logger.debug(f"{len(added_ids)}件のタスクを登録してコミットしました")
+                for i, task in enumerate(tasks):
+                    if not isinstance(task, dict):
+                        failed_tasks.append((i, "タスク情報が辞書形式ではありません"))
+                        continue
                     
+                    # タイトルの検証
+                    title = task.get('title', '')
+                    if not title or not str(title).strip():
+                        failed_tasks.append((i, "タイトルが空です"))
+                        continue
+                    
+                    title = str(title).strip()
+                    description = task.get('description', '')
+                    due_date = task.get('due_date')
+                    priority = task.get('priority', 'medium')
+                    category = task.get('category')
+                    
+                    # 期日の処理（未指定の場合は3営業日後）
+                    auto_due = False
+                    if not due_date or due_date == "" or str(due_date).lower() == "none":
+                        due_date = get_3_business_days_later()
+                        auto_due = True
+                    else:
+                        # 日付形式の検証
+                        try:
+                            datetime.strptime(str(due_date), '%Y-%m-%d')
+                        except ValueError:
+                            failed_tasks.append((i, f"期日の形式が不正です: {due_date}"))
+                            continue
+                    
+                    # 優先度の検証
+                    if priority not in valid_priorities:
+                        priority = 'medium'
+                    
+                    try:
+                        # タスクの登録
+                        cursor.execute('''
+                            INSERT INTO tasks (title, description, due_date, status, priority, category, created_at)
+                            VALUES (?, ?, ?, 'pending', ?, ?, datetime('now'))
+                        ''', (title, description, due_date, priority, category))
+                        
+                        task_id = cursor.lastrowid
+                        added_ids.append(task_id)
+                        
+                    except Exception as e:
+                        failed_tasks.append((i, str(e)))
+                        logger.warning(f"タスク {i} の登録に失敗: {str(e)}")
+                
+                # 全ての登録が成功したらSAVEPOINTを解放してコミット
+                cursor.execute('RELEASE SAVEPOINT bulk_insert_sp')
+                conn.commit()
+                
             except Exception as e:
-                failed_tasks.append((i, str(e)))
-                logger.warning(f"タスク {i} の登録に失敗: {str(e)}")
-        
-        # 残りのタスクをコミット
-        conn.commit()
-        conn.close()
+                # エラー発生時はSAVEPOINTまでロールバック
+                cursor.execute('ROLLBACK TO SAVEPOINT bulk_insert_sp')
+                cursor.execute('RELEASE SAVEPOINT bulk_insert_sp')
+                raise
         
         # 結果メッセージの構築
         result_parts = []

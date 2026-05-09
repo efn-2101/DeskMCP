@@ -37,7 +37,7 @@ python app.py
 - **OpenAI 互換 API 対応** — Ollama / vLLM / LM Studio など、OpenAI 互換の推論エンドポイントを利用可能（デフォルト: Ollama `localhost:11434`）
 - **小規模LLM対応** — ツールフィルタリング・説明圧縮・強化版システムプロンプトにより、4B〜9B程度の小規模モデルでもツールを適切に認識・使い分け可能（詳細は「⚙️ 設定方法」を参照）
 - **ツール実行承認システム** — `create_` / `update_` / `delete_` 等の危険操作はユーザーの承認が必要。`get_` / `list_` / `check_` 等の安全な操作は自動実行されます
-- **コンテキスト剪定（Pruning）** — ツールの大量出力を先頭保持＋省略表示で要約し、コンテキスト上限に収めます。参照系4000文字／更新系2000文字／情報系1000文字のカテゴリ別上限で、長大なツール結果を適切に圧縮します（デフォルト: ハードリミット32000トークン / ソフトリミット24000トークン）
+- **コンテキスト剪定（Pruning）** — ツールの大量出力を先頭保持＋省略表示で要約し、コンテキスト上限に収めます。`max_context_tokens` でコンテキスト全体の上限を設定し、`tool_result_max_chars` でツール結果の文字数上限を統一的に管理します（デフォルト: 128000トークン / ツール結果4000文字）
 - **ループ検出** — 3段階（完全一致・ツール名一致・総呼び出し回数）で無限ループを検出し、エージェントの暴走を防ぎます
 - **アクションボタン / マクロ** — 設定ファイルで定義したボタンをチャット UI に表示し、ワンクリックで所定のプロンプトとペルソナを注入できます
 - **チャット履歴の永続化** — SQLite（WALモード）によりスレッド・ステップ単位で会話履歴を保存し、セッション再開が可能です
@@ -280,17 +280,8 @@ LLM、コンテキスト管理、ツールフィルタリングなどのシス�
     "max_tokens": 16384
   },
   "context_management": {
-    "hard_limit_tokens": 32000,
-    "soft_limit_tokens": 24000,
-    "tool_definition_budget_tokens": 8000,
-    "message_history_budget_tokens": 8000,
-    "tool_result_pruning": {
-      "read_max_chars": 4000,
-      "write_max_chars": 2000,
-      "info_max_chars": 1000,
-      "default_max_chars": 3000,
-      "soft_limit_tokens": 2000
-    }
+    "max_context_tokens": 128000,
+    "tool_result_max_chars": 4000
   },
   "agent_safeguards": {
     "max_repeated_loops": 3,
@@ -326,11 +317,8 @@ LLM、コンテキスト管理、ツールフィルタリングなどのシス�
 | `llm_settings.model_name` | 使用するモデル名 |
 | `llm_settings.temperature` | サンプリング温度（0.0〜1.0、低いほど決定的） |
 | `llm_settings.max_tokens` | 1回の推論で生成する最大トークン数 |
-| `context_management.hard_limit_tokens` | コンテキストのハードリミット（トークン数） |
-| `context_management.soft_limit_tokens` | コンテキストのソフトリミット（トークン数） |
-| `context_management.tool_definition_budget_tokens` | ツール定義に割り当てるトークン予算 |
-| `context_management.message_history_budget_tokens` | メッセージ履歴に割り当てるトークン予算 |
-| `context_management.tool_result_pruning` | ツール結果の剪定設定（参照系/更新系/情報系の文字数上限） |
+| `context_management.max_context_tokens` | コンテキスト全体の上限（1つでOK。内部で自動配分） |
+| `context_management.tool_result_max_chars` | ツール結果の文字数上限（統合設定） |
 | `tool_filter_settings.max_tools` | 最大ツール数（小規模LLMは10〜20推奨） |
 | `tool_filter_settings.compression_mode` | ツール説明の圧縮モード（`compact` / `minimal` / `full`）。デフォルトは `full`（32K+モデルでは自動的に圧縮なし） |
 
@@ -342,10 +330,8 @@ LLM、コンテキスト管理、ツールフィルタリングなどのシス�
 {
   "llm_settings": { "model_name": "gemma3:4b" },
   "context_management": {
-    "hard_limit_tokens": 4096,
-    "soft_limit_tokens": 3000,
-    "tool_definition_budget_tokens": 4000,
-    "message_history_budget_tokens": 2000
+    "max_context_tokens": 8192,
+    "tool_result_max_chars": 2000
   },
   "tool_filter_settings": {
     "enabled": true,
@@ -362,6 +348,7 @@ LLM、コンテキスト管理、ツールフィルタリングなどのシス�
 - `max_tools` を10〜15程度に制限し、ツール選択の負担を軽減
 - デフォルトの圧縮モードは `full` ですが、小規模LLMでは `compression_mode` を `compact` に設定し、ツール説明を簡潔化
 - `use_enhanced_prompt` を `true` に設定し、ツール使い分けのガイドラインを追加
+- `max_context_tokens` だけでコンテキスト管理が完結（内部でhard/soft limit等を自動計算）
 
 ### ツールフィルタリングの仕組み
 
