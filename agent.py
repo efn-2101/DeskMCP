@@ -1308,15 +1308,12 @@ class Agent:
                         
                         yield tool_step
                 
-                # ツール実行後、LLMがcontentを同時に返していた場合はループ終了
-                # （LLMが「このツール実行が最後」として報告を含めて返すケース）
+                # ツール実行後、LLMがcontentを同時に返していた場合は履歴に追加して継続
+                # （LLMがプレビュー的な応答を含めて返すケース。ツール結果を渡して再度推論させる）
                 if llm_response.content:
-                    logger.info(f"[診断] ツール実行後のcontent応答を検知、ループ終了: {llm_response.content[:100]}...")
+                    logger.info(f"[診断] ツール実行後のcontent応答を検知、履歴に追加: {llm_response.content[:100]}...")
                     self.history.add_assistant_message(llm_response.content)
-                    async with cl.Step(name="応答") as response_step:
-                        response_step.output = llm_response.content
-                        yield response_step
-                    break  # whileループを抜けて終了
+                    # breakを削除 - ツール結果を渡して再度推論させる
                 
                 # 履歴追加後、再度推論へ（ループ継続）
                 continue
