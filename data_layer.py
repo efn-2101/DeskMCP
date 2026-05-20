@@ -217,6 +217,51 @@ class SQLiteDataLayer(BaseDataLayer):
         logger.info(f"スレッド削除: {thread_id}")
         return True
     
+    async def cleanup_empty_threads(self) -> int:
+        """
+        空スレッド（実質的なユーザー入力がないスレッド）を一括削除
+        
+        user_messageタイプまたはname='User'のステップを含まないスレッドを削除。
+        ブラウザリロード等でon_chat_endが呼ばれずに残ったゴミスレッドを掃除する。
+        
+        Returns:
+            削除したスレッド数
+        """
+        await self._init_db()
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            # 削除対象スレッドIDを取得：
+            # user_messageタイプもname='User'も含まないスレッド
+            cursor = await db.execute(
+                """
+                SELECT t.id FROM threads t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM steps s
+                    WHERE s.thread_id = t.id
+                    AND (s.type = 'user_message' OR s.name = 'User')
+                )
+                """
+            )
+            rows = await cursor.fetchall()
+            empty_thread_ids = [row[0] for row in rows]
+            
+            if empty_thread_ids:
+                # 関連するステップを先に削除
+                placeholders = ','.join('?' * len(empty_thread_ids))
+                await db.execute(
+                    f"DELETE FROM steps WHERE thread_id IN ({placeholders})",
+                    empty_thread_ids
+                )
+                # スレッドを削除
+                await db.execute(
+                    f"DELETE FROM threads WHERE id IN ({placeholders})",
+                    empty_thread_ids
+                )
+                await db.commit()
+                logger.info(f"空スレッドを{len(empty_thread_ids)}件削除しました")
+            
+            return len(empty_thread_ids)
+    
     async def update_thread(self, thread_id: str, **kwargs):
         """
         スレッド情報を更新
@@ -524,7 +569,9 @@ class SQLiteDataLayer(BaseDataLayer):
                 """
                 SELECT * FROM threads
                 WHERE EXISTS (
-                    SELECT 1 FROM steps WHERE steps.thread_id = threads.id
+                    SELECT 1 FROM steps
+                    WHERE steps.thread_id = threads.id
+                    AND (steps.type = 'user_message' OR steps.name = 'User')
                 )
                 ORDER BY updated_at DESC
                 LIMIT ?

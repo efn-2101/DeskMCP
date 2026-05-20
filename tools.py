@@ -1722,6 +1722,7 @@ class ErrorType(Enum):
     PERMISSION_ERROR = "permission_error"
     TIMEOUT = "timeout"
     CONNECTION_ERROR = "connection_error"
+    NOT_FOUND = "not_found"
     UNKNOWN = "unknown"
 
 
@@ -1761,6 +1762,10 @@ class ToolExecutionErrorHandler:
         if any(keyword in error_message for keyword in ["connection", "connect", "network", "unreachable"]):
             return ErrorType.CONNECTION_ERROR
         
+        # 見つからない
+        if any(keyword in error_message for keyword in ["not found", "not_found", "does not exist", "no such"]):
+            return ErrorType.NOT_FOUND
+        
         return ErrorType.UNKNOWN
     
     @staticmethod
@@ -1796,6 +1801,57 @@ class ToolExecutionErrorHandler:
             return f"ツール '{tool_name}' の実行中に接続エラーが発生しました"
         
         return f"ツール '{tool_name}' の実行中にエラーが発生しました: {str(error)}"
+    
+    @staticmethod
+    def generate_structured_error(error: Exception, tool_name: str, missing_params: list = None) -> dict:
+        """
+        構造化エラーレスポンスを生成
+        
+        Args:
+            error: 発生した例外
+            tool_name: ツール名
+            missing_params: 欠けているパラメータのリスト
+            
+        Returns:
+            構造化エラーレスポンス辞書
+        """
+        error_type = ToolExecutionErrorHandler.classify_error(error)
+        error_message = str(error)
+        
+        # retryable判定
+        retryable = error_type in [
+            ErrorType.MISSING_REQUIRED,
+            ErrorType.TYPE_ERROR,
+            ErrorType.TIMEOUT,
+            ErrorType.CONNECTION_ERROR
+        ]
+        
+        # suggestion生成
+        suggestion = ""
+        if error_type == ErrorType.MISSING_REQUIRED:
+            if missing_params:
+                suggestion = f"必須パラメータ {', '.join(missing_params)} を指定してください"
+            else:
+                suggestion = "必須パラメータを確認して指定してください"
+        elif error_type == ErrorType.TYPE_ERROR:
+            suggestion = "パラメータの型を確認して修正してください"
+        elif error_type == ErrorType.TIMEOUT:
+            suggestion = "時間をおいて再試行してください"
+        elif error_type == ErrorType.CONNECTION_ERROR:
+            suggestion = "MCPサーバーの接続状態を確認してください"
+        elif error_type == ErrorType.PERMISSION_ERROR:
+            suggestion = "権限のある操作のみ実行してください"
+        elif error_type == ErrorType.NOT_FOUND:
+            suggestion = "ツール名またはリソースが存在するか確認してください"
+        
+        return {
+            "status": "error",
+            "error_code": error_type.value,
+            "message": error_message,
+            "suggestion": suggestion,
+            "tool_name": tool_name,
+            "retryable": retryable
+        }
 
 
 # ============================================

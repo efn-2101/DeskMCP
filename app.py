@@ -650,6 +650,29 @@ async def on_message(message: cl.Message):
     Args:
         message: ユーザーからの入力メッセージ
     """
+    # スレッド名が未設定またはデフォルト値の場合、最初のユーザーメッセージで更新
+    if message.content:
+        # ChainlitのネイティブなスレッドIDを直接使用
+        thread_id = cl.context.session.thread_id
+        
+        if thread_id:
+            try:
+                current_thread = await cl_data._data_layer.get_thread(thread_id)
+                if current_thread:
+                    current_name = current_thread.get("name")
+                    # 未設定、空、またはデフォルト名の場合に更新
+                    if not current_name or current_name in [None, "", "新しいチャット", "無題の会話"]:
+                        # 先頭30文字をスレッド名に（絵文字等も含めて）
+                        new_name = message.content.strip()[:30]
+                        if new_name:
+                            await cl_data._data_layer.update_thread(
+                                thread_id=thread_id,
+                                name=new_name
+                            )
+                            logger.info(f"スレッド名を更新: '{new_name}'")
+            except Exception as e:
+                logger.error(f"スレッド名更新エラー: {e}")
+    
     # 古いアクションメニューを削除
     old_menu = cl.user_session.get("action_menu_msg")
     if old_menu:
@@ -772,6 +795,31 @@ async def _inject_macro_prompt(btn_config: dict) -> None:
 @cl.on_chat_end
 async def on_chat_end():
     logger.info("=== セッション終了 ===")
+    
+    # 空スレッド削除処理：実質的なユーザー入力がないスレッドは削除する
+    thread_id = cl.context.session.thread_id if hasattr(cl.context, 'session') else None
+    if not thread_id:
+        thread_id = cl.user_session.get("thread_id")
+    
+    if thread_id:
+        try:
+            steps = await cl_data._data_layer.get_steps(thread_id)
+            
+            # 実質的なユーザー入力を判定：
+            # - user_messageタイプのステップがある、または
+            # - name='User' のステップがある（マクロ注入メッセージ）
+            has_user_input = any(
+                step.get("type") == "user_message" or step.get("name") == "User"
+                for step in steps
+            )
+            
+            # ステップ総数が少なく（5件以下）、かつ実質的なユーザー入力がない場合のみ削除
+            if not has_user_input and len(steps) <= 5:
+                await cl_data._data_layer.delete_thread(thread_id)
+                logger.info(f"空スレッドを削除しました: {thread_id} (steps={len(steps)})")
+        except Exception as e:
+            logger.error(f"空スレッド削除エラー: {e}")
+    
     mcp_manager = cl.user_session.get("mcp_manager")
     
     if mcp_manager:

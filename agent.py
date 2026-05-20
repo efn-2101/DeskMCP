@@ -539,6 +539,7 @@ class LLMResponse:
     content: str
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = "stop"
+    thinking: str = ""  # <thinking>タグ内の推論内容
 
 
 # ============================================
@@ -832,13 +833,14 @@ class MessageHistory:
         メッセージを要約版に変換
         
         - tool メッセージ: 先頭500文字（通常）/ 100文字（積極的圧縮）に切り詰め
+          または事実要約（ツール名と結果の要約）
         - assistant メッセージ: 先頭400文字に切り詰め
         - user メッセージ: 先頭400文字に切り詰め（マルチモーダルは要約しない）
         - tool_calls を含む assistant メッセージ: 要約しない（構造を保持）
         
         Args:
             msg: 要約対象メッセージ
-            aggressive: Trueの場合、toolメッセージをより積極的に圧縮
+            aggressive: Trueの場合、toolメッセージをより積極的に圧縮（事実要約）
         """
         role = msg.get("role", "")
         content = msg.get("content", "")
@@ -855,9 +857,15 @@ class MessageHistory:
             return None
         
         if role == "tool":
-            limit = 100 if aggressive else 500
-            if len(content) > limit:
-                return {**msg, "content": content[:limit] + f"\n... [要約: 全{len(content)}文字]"}
+            if aggressive:
+                # 積極的圧縮: ツール結果を事実要約
+                tool_name = msg.get("name", "")
+                fact_summary = self._summarize_tool_fact(tool_name, content)
+                return {**msg, "content": fact_summary}
+            else:
+                limit = 500
+                if len(content) > limit:
+                    return {**msg, "content": content[:limit] + f"\n... [要約: 全{len(content)}文字]"}
         elif role == "assistant":
             if len(content) > 400:
                 return {**msg, "content": content[:400] + "\n... [要約]"}
@@ -866,6 +874,40 @@ class MessageHistory:
                 return {**msg, "content": content[:400] + "\n... [要約]"}
         
         return None
+    
+    def _summarize_tool_fact(self, tool_name: str, content: str) -> str:
+        """
+        ツール実行結果を1行の事実に要約
+        
+        Args:
+            tool_name: ツール名
+            content: ツール実行結果のテキスト
+            
+        Returns:
+            1行の事実要約
+        """
+        # JSON形式のエラーレスポンスの場合
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict) and data.get("status") == "error":
+                return f"[要約] {tool_name}: エラー発生 ({data.get('error_code', 'UNKNOWN')})"
+        except (json.JSONDecodeError, ValueError):
+            pass
+        
+        # 行数で要約
+        lines = content.strip().split('\n')
+        if len(lines) <= 3:
+            return f"[要約] {tool_name}: {content[:100]}"
+        
+        # 結果の種類を推測して要約
+        content_lower = content.lower()
+        if "件" in content or "count" in content_lower or "total" in content_lower:
+            # 件数系結果
+            return f"[要約] {tool_name}: {len(lines)}行の結果を取得"
+        elif "success" in content_lower or "完了" in content or "完了しました" in content:
+            return f"[要約] {tool_name}: 処理完了"
+        else:
+            return f"[要約] {tool_name}: {len(lines)}行の結果"
     
     def _trim_to_budget(self) -> list:
         """
@@ -878,6 +920,7 @@ class MessageHistory:
         """
         system_msgs = []
         latest_user_msg = None
+        protected_msgs = []  # 最新3往復を保護
         
         # 優先メッセージの分離
         for msg in self.messages:
@@ -886,14 +929,35 @@ class MessageHistory:
             elif msg.get("role") == "user":
                 latest_user_msg = msg  # 最後のuserメッセージを保持
         
+        # 最新3往復のメッセージを保護（user + assistant + tool）
+        # 末尾から遡って、最新のuserメッセージを起点に3往復分を保護
+        if latest_user_msg:
+            latest_user_idx = None
+            for i, msg in enumerate(self.messages):
+                if msg is latest_user_msg:
+                    latest_user_idx = i
+                    break
+            
+            if latest_user_idx is not None:
+                # latest_user_msg から後ろのメッセージを保護（最大3往復 = 6メッセージ）
+                # user → assistant → tool → assistant → tool → assistant のパターンを想定
+                protected_count = 0
+                max_protected = 6  # 3往復分
+                for i in range(latest_user_idx, len(self.messages)):
+                    msg = self.messages[i]
+                    if msg not in system_msgs:
+                        protected_msgs.append(msg)
+                        protected_count += 1
+                        if protected_count >= max_protected:
+                            break
+        
         # 残りのメッセージ（古い順）
         other_msgs = [m for m in self.messages
-                      if m not in system_msgs and m is not latest_user_msg]
+                      if m not in system_msgs and m not in protected_msgs]
         
         # 優先メッセージのトークン数
         priority_tokens = self._estimate_messages_tokens(system_msgs)
-        if latest_user_msg:
-            priority_tokens += self._estimate_messages_tokens([latest_user_msg])
+        priority_tokens += self._estimate_messages_tokens(protected_msgs)
         
         # --- Phase 1: 通常要約（soft_limit超過時、古い順に要約） ---
         remaining_budget = self._soft_limit_tokens - priority_tokens
@@ -915,8 +979,10 @@ class MessageHistory:
         
         phase1_msgs.reverse()
         result = system_msgs + phase1_msgs
-        if latest_user_msg:
-            result.append(latest_user_msg)
+        # 保護メッセージを追加（順序を保持）
+        for msg in protected_msgs:
+            if msg not in result:
+                result.append(msg)
         
         total = self._estimate_messages_tokens(result)
         
@@ -959,8 +1025,10 @@ class MessageHistory:
             
             phase2_msgs.reverse()
             result = system_msgs + phase2_msgs
-            if latest_user_msg:
-                result.append(latest_user_msg)
+            # 保護メッセージを追加（順序を保持）
+            for msg in protected_msgs:
+                if msg not in result:
+                    result.append(msg)
             
             total = self._estimate_messages_tokens(result)
         
@@ -1075,6 +1143,12 @@ class Agent:
 4. ツール実行結果に基づいて、ユーザーに分かりやすく要約して報告してください
 5. 推論過程をユーザーに見せる必要はありません。結論と根拠を簡潔に述べてください
 6. 不確かな情報は「確信が持てません」と正直に伝えてください
+
+## 推論とツール使用の原則
+- ツールを使用する前、または複雑な回答を行う前に、必ず `<thinking>` タグ内で推論過程を記述してください
+- `<thinking>` タグの内容はユーザーには表示されません（内部処理用）
+- 推論内容: ユーザーの意図分析 → 必要な情報の特定 → ツール選択の理由 → 実行計画
+- `</thinking>` タグを閉じた後に、実際のツール呼び出しまたはユーザー応答を行ってください
 
 ## 現在のシステム時刻
 {current_time}
@@ -1223,6 +1297,11 @@ class Agent:
                 # 【診断ログ】ツール呼び出しの詳細を記録
                 logger.info(f"[診断] ツール呼び出し検知: {len(tool_calls)}件, ツール名: {[tc.name for tc in tool_calls]}")
                 
+                # 1ターン1ツール制限: 複数ツール呼び出し時は最初の1件のみ実行
+                if len(tool_calls) > 1:
+                    logger.warning(f"1ターン1ツール制限: {len(tool_calls)}件のツール呼び出しを検知 → 最初の1件のみ実行 ({tool_calls[0].name})")
+                    tool_calls = [tool_calls[0]]
+                
                 # 異常挙動検知（仕様書5.3.1）
                 if self._detect_loop(tool_calls):
                     async with cl.Step(name="⚠️ 異常検知") as warn_step:
@@ -1286,24 +1365,32 @@ class Agent:
                             tool_step.output = summary
                             
                         except asyncio.TimeoutError:
+                            from tools import ToolExecutionErrorHandler
                             error_msg = f"ツール実行がタイムアウトしました（{self.config.tool_execution_timeout_seconds}秒）"
                             tool_step.output = f"❌ {error_msg}"
+                            structured_error = ToolExecutionErrorHandler.generate_structured_error(
+                                Exception(error_msg), tool_call.name
+                            )
                             self.history.add_tool_result(
                                 tool_call_id=tool_call.id,
                                 tool_name=tool_call.name,
-                                raw_result={"error": "timeout"},
-                                summary=error_msg
+                                raw_result=structured_error,
+                                summary=json.dumps(structured_error, ensure_ascii=False)
                             )
                             
                         except Exception as e:
+                            from tools import ToolExecutionErrorHandler
                             error_msg = f"ツール実行エラー: {str(e)}"
                             tool_step.output = f"❌ {error_msg}"
                             logger.error(f"ツール実行エラー: {e}")
+                            structured_error = ToolExecutionErrorHandler.generate_structured_error(
+                                e, tool_call.name
+                            )
                             self.history.add_tool_result(
                                 tool_call_id=tool_call.id,
                                 tool_name=tool_call.name,
-                                raw_result={"error": str(e)},
-                                summary=error_msg
+                                raw_result=structured_error,
+                                summary=json.dumps(structured_error, ensure_ascii=False)
                             )
                         
                         yield tool_step
@@ -1541,7 +1628,18 @@ class Agent:
         finish_reason = choice.get("finish_reason", "stop")
         
         # コンテンツを取得
-        content = message.get("content", "")
+        raw_content = message.get("content", "")
+        
+        # <thinking> タグの抽出
+        thinking = ""
+        content = raw_content
+        import re
+        thinking_match = re.search(r'<thinking>(.*?)</thinking>', raw_content, re.DOTALL)
+        if thinking_match:
+            thinking = thinking_match.group(1).strip()
+            # thinkingタグを除去したコンテンツ
+            content = re.sub(r'<thinking>.*?</thinking>', '', raw_content, flags=re.DOTALL).strip()
+            logger.debug(f"[thinking] 推論内容を抽出: {thinking[:100]}...")
         
         # ツール呼び出しを取得
         tool_calls = []
@@ -1565,7 +1663,8 @@ class Agent:
         return LLMResponse(
             content=content,
             tool_calls=tool_calls,
-            finish_reason=finish_reason
+            finish_reason=finish_reason,
+            thinking=thinking
         )
     
     def _has_tool_calls(self, llm_response: LLMResponse) -> bool:
