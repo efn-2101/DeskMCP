@@ -76,8 +76,16 @@ class SQLiteDataLayer(BaseDataLayer):
                     FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE
                 );
                 
-                CREATE INDEX IF NOT EXISTS idx_steps_thread_id 
+                CREATE INDEX IF NOT EXISTS idx_steps_thread_id
                     ON steps(thread_id);
+                
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id TEXT NOT NULL,
+                    setting_key TEXT NOT NULL,
+                    setting_value TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, setting_key)
+                );
             """)
             await db.commit()
     
@@ -503,6 +511,59 @@ class SQLiteDataLayer(BaseDataLayer):
     async def close(self) -> None:
         """リソースの解放（SQLite接続は都度閉じているので何もしない）"""
         pass
+    
+    # ============================================
+    # ユーザー設定（user_settings）メソッド
+    # ============================================
+    
+    async def get_user_setting(self, user_id: str, key: str) -> Optional[str]:
+        """
+        ユーザー設定を取得
+        
+        Args:
+            user_id: ユーザー識別子
+            key: 設定キー
+            
+        Returns:
+            設定値（存在しない場合はNone）
+        """
+        await self._init_db()
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT setting_value FROM user_settings WHERE user_id = ? AND setting_key = ?",
+                (user_id, key)
+            )
+            row = await cursor.fetchone()
+            return row["setting_value"] if row else None
+    
+    async def set_user_setting(self, user_id: str, key: str, value: str) -> None:
+        """
+        ユーザー設定を保存・更新
+        
+        Args:
+            user_id: ユーザー識別子
+            key: 設定キー
+            value: 設定値
+        """
+        await self._init_db()
+        
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO user_settings (user_id, setting_key, setting_value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, key, value, now)
+            )
+            await db.commit()
+        
+        logger.info(f"ユーザー設定保存: user_id={user_id}, key={key}")
     
     async def create_element(
         self,

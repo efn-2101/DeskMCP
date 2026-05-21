@@ -314,11 +314,21 @@ async def setup_chat_settings() -> None:
         if not server_name or health_status.get(server_name, False):
             filtered_buttons.append(btn)
     
-    # 現在の表示設定を取得（初回は全て表示＝True）
+    # 現在の表示設定を取得（DB優先、未設定時は全て表示）
     visible_macros = cl.user_session.get("visible_macros")
     if visible_macros is None:
-        # 初回はフィルタリング後のマクロIDをリスト化
-        visible_macros = [btn.get("id", btn.get("ui_label", "")) for btn in filtered_buttons]
+        # DBからユーザー設定を読み込む
+        try:
+            db_value = await data_layer.get_user_setting("local_user", "visible_macros")
+            if db_value:
+                visible_macros = json.loads(db_value)
+                logger.info(f"DBからvisible_macrosを復元: {visible_macros}")
+            else:
+                # DB未設定時は全て表示
+                visible_macros = [btn.get("id", btn.get("ui_label", "")) for btn in filtered_buttons]
+        except Exception as e:
+            logger.warning(f"visible_macrosのDB読み込みに失敗しました: {e}")
+            visible_macros = [btn.get("id", btn.get("ui_label", "")) for btn in filtered_buttons]
         cl.user_session.set("visible_macros", visible_macros)
     
     # ドロップダウンの選択肢を作成（文字列リスト形式）
@@ -389,16 +399,33 @@ async def on_settings_update(settings: dict) -> None:
     
     # 表示設定の更新（トグルが切り替えられた場合）
     action_buttons = await _load_buttons_config()
-    visible_macros = []
+    
+    # 現在の表示設定をベースにして変更を適用
+    # Chainlitのsettingsは変更された項目のみを含むため、
+    # 変更されていない項目は現在の状態を維持する必要がある
+    visible_macros = cl.user_session.get("visible_macros") or []
     
     for btn in action_buttons:
         macro_id = btn.get("id", btn.get("ui_label", ""))
         switch_key = f"switch_{macro_id}"
-        if settings.get(switch_key, True):
-            visible_macros.append(macro_id)
+        if switch_key in settings:
+            # このスイッチが変更された場合のみ更新
+            if settings[switch_key]:
+                if macro_id not in visible_macros:
+                    visible_macros.append(macro_id)
+            else:
+                if macro_id in visible_macros:
+                    visible_macros.remove(macro_id)
     
     # セッションに保存
     cl.user_session.set("visible_macros", visible_macros)
+    
+    # DBに永続化（全スレッドで共有）
+    try:
+        await data_layer.set_user_setting("local_user", "visible_macros", json.dumps(visible_macros))
+        logger.info(f"visible_macrosをDBに保存: {visible_macros}")
+    except Exception as e:
+        logger.error(f"visible_macrosのDB保存に失敗しました: {e}")
     
     # アクションメニューを再描画
     asyncio.create_task(send_action_menu())
@@ -434,6 +461,21 @@ async def header_auth_callback(headers: dict):
 # ============================================
 # セッション初期化
 # ============================================
+async def _load_visible_macros_from_db():
+    """DBからvisible_macros設定を読み込み、セッションに設定するヘルパー"""
+    try:
+        db_value = await data_layer.get_user_setting("local_user", "visible_macros")
+        if db_value:
+            visible_macros = json.loads(db_value)
+            cl.user_session.set("visible_macros", visible_macros)
+            logger.info(f"DBからvisible_macrosを復元: {visible_macros}")
+        else:
+            cl.user_session.set("visible_macros", None)
+    except Exception as e:
+        logger.warning(f"visible_macrosのDB読み込みに失敗しました: {e}")
+        cl.user_session.set("visible_macros", None)
+
+
 @cl.on_chat_start
 async def on_chat_start():
     logger.info("=== セッション初期化開始 ===")
@@ -463,6 +505,9 @@ async def on_chat_start():
             author="SystemWelcome",
             content="🤖 エージェントを起動しました。何かお手伝いしましょうか？"
         ).send()
+        
+        # DBからvisible_macrosを事前に復元してからChatSettingsを初期化
+        await _load_visible_macros_from_db()
         
         # ChatSettings（歯車メニュー）を初期化
         await setup_chat_settings()
@@ -547,6 +592,10 @@ async def on_chat_resume(thread: dict):
             agent.history.messages = restored_messages
         
         logger.info(f"履歴復元完了: {len(restored_messages)}件のメッセージ")
+        
+        # 【重要】既存スレッド再開時もDBから最新の表示設定を読み込むため、
+        # 事前にDBから復元してからChatSettingsを初期化
+        await _load_visible_macros_from_db()
         
         # ChatSettings（歯車メニュー）を初期化
         await setup_chat_settings()

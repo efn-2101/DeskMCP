@@ -1169,6 +1169,8 @@ class Agent:
         self._tool_call_counter = {}  # 連続呼び出し検知用
         self._rejection_occurred = False  # ユーザー拒否発生フラグ（LLM暴走防止用）
         self._initial_user_input = None  # 初回ユーザー入力保存用（ツールフィルタリング用）
+        self._empty_response_retry_count = 0  # 空応答リトライカウンター
+        self._max_empty_retries = 3  # 空応答最大リトライ回数
         
         logger.info(f"エージェント初期化完了: model={config.model_name}, base_url={config.base_url}")
     
@@ -1249,6 +1251,7 @@ class Agent:
         self._cancel_requested = False
         self._tool_call_counter.clear()
         self._rejection_occurred = False  # 拒否フラグをリセット
+        self._empty_response_retry_count = 0  # 空応答リトライカウンターをリセット
         
         loop_count = 0
         max_iterations = 10  # 無限ループ防止の安全策
@@ -1416,11 +1419,47 @@ class Agent:
                 async with cl.Step(name="応答") as response_step:
                     response_step.output = llm_response.content
                     yield response_step
+                break  # ループ終了
             else:
                 # 【診断ログ】自然言語応答なし（異常終了の可能性）
                 logger.warning(f"[診断] 自然言語応答なし、contentが空です。finish_reason={llm_response.finish_reason}")
-            
-            break  # ループ終了
+                
+                # ========================================
+                # 空応答リトライ処理
+                # ========================================
+                if self._empty_response_retry_count < self._max_empty_retries:
+                    self._empty_response_retry_count += 1
+                    retry_msg = f"🔄 LLMから空の応答を受信しました。再試行 {self._empty_response_retry_count}/{self._max_empty_retries} 回目です。"
+                    logger.warning(retry_msg)
+                    
+                    async with cl.Step(name="⚠️ 空応答検知") as retry_step:
+                        retry_step.output = retry_msg
+                        yield retry_step
+                    
+                    # 履歴に再試行促進メッセージを追加（システムメッセージとして）
+                    self.history.messages.append({
+                        "role": "system",
+                        "content": "【システム通知】前回の応答が空でした。ユーザーの質問に対して必ず回答を生成してください。"
+                    })
+                    
+                    # ループを継続して再推論
+                    continue
+                else:
+                    # 最大リトライ回数に達した
+                    error_msg = f"❌ LLMからの応答生成に失敗しました（空応答が{self._max_empty_retries}回連続しました）。ページを再読み込みして再度お試しください。"
+                    logger.error(error_msg)
+                    
+                    async with cl.Step(name="❌ 応答生成失敗") as error_step:
+                        error_step.output = error_msg
+                        yield error_step
+                    
+                    # エラーメッセージを履歴に追加
+                    self.history.add_assistant_message(error_msg)
+                    
+                    # 最終的なエラーメッセージをユーザーに表示
+                    await cl.Message(content=error_msg).send()
+                    
+                    break  # ループ終了
         
         if loop_count >= max_iterations:
             async with cl.Step(name="⚠️ 最大反復回数") as warn_step:
