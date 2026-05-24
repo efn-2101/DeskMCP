@@ -32,7 +32,7 @@ python app.py
 
 自律型エージェントによるタスク実行と、プライベート環境での安全なデータ管理を提供します。
 
-- **自律型エージェントループ** — ユーザーの指示を受けると、LLM が推論→ツール実行判定→ツール実行→履歴更新→再推論を最大10回まで自動反復し、タスクを完遂します
+- **自律型エージェントループ** — ユーザーの指示を受けると、LLM が推論→ツール実行判定→ツール実行→履歴更新→再推論を自動反復し、タスクを完遂します（`system_config.json` の `max_iterations` で反復上限を設定可能、デフォルト10回）
 - **MCP プロトコル統合** — Stdio / SSE 両トランスポートに対応し、複数の MCP サーバーからツールを動的に取得・実行します
 - **OpenAI 互換 API 対応** — Ollama / vLLM / LM Studio など、OpenAI 互換の推論エンドポイントを利用可能（デフォルト: Ollama `localhost:11434`）
 - **小規模LLM対応** — ツールフィルタリング・説明圧縮・強化版システムプロンプトにより、4B〜9B程度の小規模モデルでもツールを適切に認識・使い分け可能（詳細は「⚙️ 設定方法」を参照）
@@ -190,7 +190,7 @@ flowchart TD
     L --> M{ループ検出}
     M -->|ループ検出| N[停止]
     M -->|ループ未検出| B
-    N --> O[最大10回まで反復]
+    N --> O[max_iterations 回まで反復]
 
     style A fill:#e1f5fe
     style D fill:#c8e6c9
@@ -285,6 +285,7 @@ LLM、コンテキスト管理、ツールフィルタリングなどのシス�
   },
   "agent_safeguards": {
     "max_repeated_loops": 3,
+    "max_iterations": 10,
     "inference_timeout_seconds": 180,
     "tool_execution_timeout_seconds": 60
   },
@@ -319,6 +320,8 @@ LLM、コンテキスト管理、ツールフィルタリングなどのシス�
 | `llm_settings.max_tokens` | 1回の推論で生成する最大トークン数 |
 | `context_management.max_context_tokens` | コンテキスト全体の上限（1つでOK。内部で自動配分） |
 | `context_management.tool_result_max_chars` | ツール結果の文字数上限（統合設定） |
+| `agent_safeguards.max_iterations` | 1回の会話での推論ループ上限（推論→ツール実行→再推論の反復回数） |
+| `agent_safeguards.max_repeated_loops` | 同じツールを同じ引数で連続呼び出しした場合のループ検知閾値 |
 | `tool_filter_settings.max_tools` | 最大ツール数（小規模LLMは10〜20推奨） |
 | `tool_filter_settings.compression_mode` | ツール説明の圧縮モード（`compact` / `minimal` / `full`）。デフォルトは `full`（32K+モデルでは自動的に圧縮なし） |
 

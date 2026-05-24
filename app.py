@@ -566,10 +566,25 @@ async def on_chat_resume(thread: dict):
                 # ツール実行ステップの処理
                 # Chainlitのステップ名からツール名を抽出（"🛠️ tool_name"形式）
                 tool_name = step_name.replace("🛠️ ", "").strip() if step_name else ""
+                tool_call_id = f"resume_{len(restored_messages)}"
+                
+                # 【重要】直前に assistant + tool_calls メッセージがない場合は挿入
+                # これにより、OpenAI形式の履歴構造（assistant(tool_calls) → tool(result)）を保持
+                if not restored_messages or restored_messages[-1].get("role") != "assistant" or not restored_messages[-1].get("tool_calls"):
+                    restored_messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": "{}"
+                            }
+                        }]
+                    })
                 
                 # ツール結果メッセージを追加
-                # tool_call_id は復元できないため、プレースホルダーを使用
-                tool_call_id = f"resume_{len(restored_messages)}"
                 restored_messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
@@ -668,6 +683,11 @@ async def _process_user_input(user_input: str, server_name: str = None, file_att
             await cl.Message(content=final_response).send()
         else:
             # 応答がない場合（ツール実行のみなど）
+            last_role = last_message.get("role") if agent.history.messages else "None"
+            logger.warning(
+                f"[診断] 最終応答が空: user_input='{user_input[:50]}...', "
+                f"last_role={last_role}, messages_count={len(agent.history.messages)}"
+            )
             await cl.Message(content="処理が完了しました。").send()
             
     except Exception as e:

@@ -1147,6 +1147,68 @@ class QuotaManager:
 class ToolFilter:
     """ツールフィルタリングクラス（スコアリング対応版）"""
     
+    # ツール使用が強く期待されるキーワード（アクション系）
+    TOOL_ACTION_KEYWORDS = [
+        # 日本語 - 作成・追加系
+        "追加", "登録", "作成", "新規", "作って", "追加して", "登録して", "作成して",
+        # 日本語 - 参照・検索系
+        "一覧", "表示", "見せ", "確認", "確認して", "探して", "見つけて", "検索して",
+        # 日本語 - 更新・変更系
+        "変更", "更新", "修正", "編集", "変えて", "修正して", "変更して", "更新して",
+        # 日本語 - 削除系
+        "削除", "消去", "消して", "削る", "削除して", "消去して",
+        # 日本語 - 完了・状態変更系
+        "完了", "終了", "やった", "終わ", "完了して", "終了して",
+        # 日本語 - アーカイブ・復元系
+        "アーカイブ", "非表示", "復元", "アーカイブして", "復元して",
+        # 日本語 - 一括操作系
+        "一括", "まとめ", "全部", "一括で", "まとめて",
+        # 日本語 - ファイル操作系
+        "ファイル", "読み", "メール", "読み込み", "読んで",
+        # 日本語 - 統計・状況系
+        "統計", "状況", "数", "情報", "どれくらい", "いくつ",
+        # 日本語 - 履歴・バックアップ系
+        "履歴", "バックアップ", "変更履歴", "バックアップして",
+        # 日本語 - 期日・期限・優先度系
+        "期日", "期限", "優先度", "ステータス", "カテゴリ", "締め切り",
+        # 日本語 - 通信確認系
+        "通信確認", "接続確認", "通信テスト", "接続テスト", "確認して",
+        # 英語 - 作成・追加系
+        "add", "create", "new", "register", "insert",
+        # 英語 - 参照・検索系
+        "list", "get", "show", "search", "find", "fetch", "query", "lookup",
+        # 英語 - 更新・変更系
+        "update", "change", "modify", "edit", "rename",
+        # 英語 - 削除系
+        "delete", "remove", "destroy", "drop", "clear",
+        # 英語 - 完了・状態変更系
+        "complete", "finish", "done", "close", "resolve",
+        # 英語 - アーカイブ・復元系
+        "archive", "restore", "unarchive",
+        # 英語 - 一括操作系
+        "bulk", "batch", "mass",
+        # 英語 - ファイル操作系
+        "read", "parse", "load", "document", "file", "email", "eml", "msg",
+        # 英語 - 統計・状況系
+        "statistics", "stats", "status", "count", "info", "overview", "summary",
+        # 英語 - 履歴・バックアップ系
+        "history", "backup", "log",
+        # 英語 - 通信確認系
+        "communication", "connect", "connection", "test", "check", "health",
+    ]
+    
+    # ツール使用が期待されないキーワード（雑談・質問系）
+    NON_TOOL_KEYWORDS = [
+        # 日本語 - 挨拶・雑談系
+        "こんにちは", "おはよう", "こんばんは", "ありがとう", "さようなら", "お疲れ",
+        "教えて", "説明して", "どう思う", "なぜ", "どうして", "何", "誰", "いつ", "どこ",
+        "意味", "定義", "説明", "解説", "紹介", "例えば", "たとえば",
+        # 英語 - 挨拶・雑談系
+        "hello", "hi", "hey", "thanks", "thank you", "goodbye", "bye",
+        "explain", "why", "what", "who", "when", "where", "how",
+        "meaning", "define", "describe", "introduce", "example", "tell me about",
+    ]
+    
     # 日本語→英語キーワードマッピング（動的カテゴリ生成用）
     JAPANESE_TO_ENGLISH = {
         # 一般的なアクション
@@ -1555,6 +1617,48 @@ class ToolFilter:
         for cat in self.categories:
             lines.append(f"- {cat.name}: {', '.join(cat.keywords[:5])}")
         return '\n'.join(lines)
+    
+    def should_expect_tool_calls(self, user_input: str) -> tuple[bool, list[str]]:
+        """
+        ユーザー入力からツール呼び出しが期待されるかを判定
+        
+        ツール使用が強く期待されるキーワードが含まれ、かつ
+        雑談・質問系のキーワードが含まれない場合にツール使用を期待する。
+        
+        Args:
+            user_input: ユーザー入力テキスト
+            
+        Returns:
+            (ツール使用が期待されるか, マッチしたキーワードリスト)
+        """
+        if not user_input:
+            return False, []
+        
+        input_lower = user_input.lower()
+        
+        # 雑談・質問系キーワードが含まれる場合はツール使用を期待しない
+        non_tool_matches = []
+        for kw in self.NON_TOOL_KEYWORDS:
+            if kw.lower() in input_lower:
+                non_tool_matches.append(kw)
+        
+        # 雑談系キーワードが2つ以上マッチした場合はツール使用を期待しない
+        if len(non_tool_matches) >= 2:
+            logger.debug(f"ツール使用非期待: 雑談キーワードが{len(non_tool_matches)}件マッチ: {non_tool_matches}")
+            return False, []
+        
+        # ツール使用が期待されるキーワードを検索
+        tool_action_matches = []
+        for kw in self.TOOL_ACTION_KEYWORDS:
+            if kw.lower() in input_lower:
+                tool_action_matches.append(kw)
+        
+        # ツールアクションキーワードが1つ以上マッチした場合はツール使用を期待
+        if tool_action_matches:
+            logger.debug(f"ツール使用期待: アクションキーワードが{len(tool_action_matches)}件マッチ: {tool_action_matches}")
+            return True, tool_action_matches
+        
+        return False, []
 
 
 # ============================================
@@ -1608,6 +1712,68 @@ def _simplify_schema_for_llm(schema: dict) -> dict:
     if "items" in result and isinstance(result["items"], dict):
         result["items"] = _simplify_schema_for_llm(result["items"])
     return result
+
+
+def _minimize_schema_for_llm(schema: dict) -> dict:
+    """
+    MCPスキーマを最小限に簡略化（ツール定義サイズ削減用）
+    
+    description, title 等のメタデータを除去し、型情報と必須情報のみ保持する。
+    """
+    if not isinstance(schema, dict):
+        return schema
+    _, resolved = _resolve_schema_type(schema)
+    if not isinstance(resolved, dict):
+        return resolved
+    result = {}
+    if "type" in resolved:
+        result["type"] = resolved["type"]
+    if "enum" in resolved:
+        result["enum"] = resolved["enum"]
+    if "properties" in resolved and isinstance(resolved["properties"], dict):
+        new_props = {}
+        for key, prop in resolved["properties"].items():
+            minimized = _minimize_schema_for_llm(prop)
+            if isinstance(minimized, dict):
+                minimized.pop("description", None)
+                minimized.pop("title", None)
+            new_props[key] = minimized
+        result["properties"] = new_props
+    if "items" in resolved and isinstance(resolved["items"], dict):
+        result["items"] = _minimize_schema_for_llm(resolved["items"])
+    if "required" in resolved:
+        result["required"] = resolved["required"]
+    return result
+
+
+def _estimate_tool_definition_tokens(tools: list[dict]) -> int:
+    """
+    OpenAI形式のツール定義リストのトークン数を推定
+    
+    各ツール定義をJSON文字列化し、文字数からトークン数を推定。
+    ツール定義はJSON形式で英語主体だが、descriptionに日本語が含まれる場合があるため、
+    安全側に見積もって 1文字 ≒ 0.5トークン（JSON記号等を考慮）とする。
+    
+    Args:
+        tools: OpenAI形式のツール定義リスト
+        
+    Returns:
+        推定トークン数
+    """
+    if not tools:
+        return 0
+    
+    total_chars = 0
+    for tool in tools:
+        try:
+            tool_json = json.dumps(tool, ensure_ascii=False)
+            total_chars += len(tool_json)
+        except Exception:
+            total_chars += 500  # フォールバック
+    
+    # JSON形式のツール定義は英語主体だが、日本語descriptionがある場合も考慮
+    # 安全側に 1文字 ≒ 0.5トークン で推定
+    return int(total_chars * 0.5)
 
 
 # ============================================
@@ -1867,6 +2033,25 @@ class FilePathValidator:
     # ファイルパスと見なすキーワード
     PATH_KEYWORDS = ["path", "file", "filepath", "filename", "dir", "directory", "folder", "src", "dest", "source", "target"]
     
+    # ファイルパス検証をスキップするキー名（コード・スクリプト系パラメータ）
+    SKIP_VALIDATION_KEYS = {"function", "script", "code", "expression", "eval", "js", "javascript", "command", "cmd"}
+    
+    # URLパターン（ファイルパスではない）
+    URL_PATTERN = re.compile(r'^https?://', re.IGNORECASE)
+    
+    # JavaScript/コードらしいパターン
+    CODE_PATTERNS = [
+        re.compile(r'^\s*\(\s*\)\s*=>'),           # アロー関数: () =>
+        re.compile(r'^\s*function\s*\('),          # function 宣言
+        re.compile(r'^\s*async\s+function'),        # async function
+        re.compile(r'^\s*const\s+\w+\s*='),       # const x =
+        re.compile(r'^\s*let\s+\w+\s*='),         # let x =
+        re.compile(r'^\s*var\s+\w+\s*='),          # var x =
+        re.compile(r'^\s*document\.'),               # document.xxx
+        re.compile(r'^\s*window\.'),                 # window.xxx
+        re.compile(r'^\s*return\s+'),                # return ...
+    ]
+    
     @classmethod
     def _get_allowed_temp_prefixes(cls) -> list[str]:
         """許可された一時ディレクトリプレフィックスを取得"""
@@ -1980,10 +2165,23 @@ class FilePathValidator:
     @classmethod
     def _looks_like_file_path(cls, key: str, value: str) -> bool:
         """キー名と値からファイルパス引数かどうかを推定"""
-        # キー名にファイルパス関連の単語が含まれる場合
+        # キー名がコード・スクリプト系の場合はファイルパスではない
         key_lower = key.lower()
+        if key_lower in cls.SKIP_VALIDATION_KEYS:
+            return False
+        
+        # キー名にファイルパス関連の単語が含まれる場合
         if any(kw in key_lower for kw in cls.PATH_KEYWORDS):
             return True
+        
+        # 値がURLの場合はファイルパスではない
+        if cls.URL_PATTERN.match(value):
+            return False
+        
+        # 値がJavaScript/コードらしい場合はファイルパスではない
+        for pattern in cls.CODE_PATTERNS:
+            if pattern.search(value):
+                return False
         
         # 値が存在するファイルパスの場合
         if os.path.exists(value) and len(value) > 1:
@@ -2637,7 +2835,8 @@ class MCPClientManager:
         max_tools: int = None,
         compression_mode: str = None,
         always_include: list = None,
-        server_name: str = None
+        server_name: str = None,
+        tool_definition_budget_tokens: int = None,
     ) -> list[dict]:
         """
         LLMに渡すためのツール定義をOpenAI形式で返す
@@ -2648,6 +2847,7 @@ class MCPClientManager:
             compression_mode: 説明圧縮モード（Noneの場合は設定値を使用）
             always_include: 常に含めるツール名のリスト（Noneの場合は設定値を使用）
             server_name: MCPサーバー名（指定時は該当サーバーのツールのみを返す）
+            tool_definition_budget_tokens: ツール定義のトークン数予算（Noneの場合は制限なし）
             
         Returns:
             OpenAI Tools形式のツール定義リスト
@@ -2662,7 +2862,7 @@ class MCPClientManager:
             logger.debug(f"サーバー指定フィルタ: {server_name} -> {len(server_tools)}件")
             if not server_tools:
                 logger.warning(f"指定されたサーバー '{server_name}' のツールが見つかりません")
-            return self._convert_to_openai_tools(server_tools, compression_mode or "compact")
+            return self._build_openai_tools(server_tools, compression_mode or "compact")
         
         # 設定値の取得（引数が指定された場合は引数を優先）
         settings = self._tool_filter_settings
@@ -2688,33 +2888,65 @@ class MCPClientManager:
         logger.debug(f"フィルタリング結果: {len(filtered_tools)}件, ツール名: {[t.name for t in filtered_tools]}")
         
         # OpenAI形式に変換（説明圧縮を適用）
-        # get_description()がToolDescriptionCompressor.compress()に委譲する
-        # 単一エントリポイントとなっているため、二重圧縮を避けるため
-        # 直接Compressorを呼ばずget_description()を使用する
-        tools = []
-        for tool in filtered_tools:
-            description = tool.get_description(comp_mode)
-            simplified_schema = _simplify_schema_for_llm(tool.input_schema)
+        tools = self._build_openai_tools(filtered_tools, comp_mode)
+        
+        # ツール定義予算チェックと動的調整
+        if tool_definition_budget_tokens is not None:
+            estimated_tokens = _estimate_tool_definition_tokens(tools)
+            logger.info(f"ツール定義推定トークン数: {estimated_tokens}（予算: {tool_definition_budget_tokens}）")
             
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": description,
-                    "parameters": simplified_schema
-                }
-            })
+            # 予算超過時の段階的削減
+            current_max_tools = max_tools_limit
+            current_comp_mode = comp_mode
+            
+            while estimated_tokens > tool_definition_budget_tokens and current_max_tools > 1:
+                if current_comp_mode != "minimal":
+                    # まず圧縮モードを上げる
+                    current_comp_mode = "minimal" if current_comp_mode == "compact" else "minimal"
+                    logger.warning(
+                        f"ツール定義が予算を超過（{estimated_tokens} > {tool_definition_budget_tokens}）。"
+                        f"圧縮モードを {current_comp_mode} に変更"
+                    )
+                else:
+                    # 既にminimalならツール数を削減
+                    current_max_tools = max(1, current_max_tools // 2)
+                    logger.warning(
+                        f"ツール定義が予算を超過（{estimated_tokens} > {tool_definition_budget_tokens}）。"
+                        f"max_toolsを {current_max_tools} に削減"
+                    )
+                
+                # 再フィルタリング
+                if filter_enabled and user_input is not None:
+                    filtered_tools = self._tool_filter.filter_by_user_input(
+                        user_input,
+                        all_tools,
+                        max_tools=current_max_tools,
+                        always_include=always_include_list
+                    )
+                else:
+                    filtered_tools = all_tools[:current_max_tools] if current_max_tools else all_tools
+                
+                # 再変換
+                tools = self._build_openai_tools(filtered_tools, current_comp_mode)
+                estimated_tokens = _estimate_tool_definition_tokens(tools)
+            
+            if estimated_tokens > tool_definition_budget_tokens and len(tools) > 0:
+                logger.error(
+                    f"ツール定義を1件に削減しても予算を超過（{estimated_tokens} > {tool_definition_budget_tokens}）。"
+                    f"ツール定義を空にします。"
+                )
+                tools = []
         
         logger.info(f"LLMに渡すツール定義: {len(tools)}件（フィルタリング: {filter_enabled}, 圧縮モード: {comp_mode}）")
         return tools
     
-    def _convert_to_openai_tools(
+    def _build_openai_tools(
         self,
         tools: list[ToolSchema],
         compression_mode: str = "compact"
     ) -> list[dict]:
         """
-        ToolSchemaリストをOpenAI形式のツール定義に変換
+        ToolSchemaリストをOpenAI形式のツール定義に変換（内部ヘルパー）
         
         Args:
             tools: 変換対象のツールリスト
@@ -2726,7 +2958,10 @@ class MCPClientManager:
         result = []
         for tool in tools:
             description = tool.get_description(compression_mode)
-            simplified_schema = _simplify_schema_for_llm(tool.input_schema)
+            if compression_mode == "minimal":
+                simplified_schema = _minimize_schema_for_llm(tool.input_schema)
+            else:
+                simplified_schema = _simplify_schema_for_llm(tool.input_schema)
             
             result.append({
                 "type": "function",

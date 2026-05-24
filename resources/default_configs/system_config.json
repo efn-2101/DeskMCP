@@ -9,10 +9,12 @@
   },
   "context_management": {
     "max_context_tokens": 128000,
-    "tool_result_max_chars": 100000
+    "tool_result_max_chars": 100000,
+    "tool_definition_budget_ratio": 0.25
   },
   "agent_safeguards": {
     "max_repeated_loops": 3,
+    "max_iterations": 10,
     "inference_timeout_seconds": 180,
     "tool_execution_timeout_seconds": 60
   },

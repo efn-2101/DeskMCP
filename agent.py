@@ -18,7 +18,7 @@ import base64
 from typing import AsyncGenerator, Optional, Any
 from dataclasses import dataclass, field
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 import httpx
 
@@ -101,8 +101,10 @@ def _get_default_config() -> dict:
         },
         "agent_safeguards": {
             "max_repeated_loops": 3,
+            "max_iterations": 10,
             "inference_timeout_seconds": 180,
-            "tool_execution_timeout_seconds": 60
+            "tool_execution_timeout_seconds": 60,
+            "max_llm_retries": 3
         },
         "tool_filter_settings": {
             "enabled": True,
@@ -215,6 +217,17 @@ ENHANCED_SYSTEM_PROMPT_TEMPLATE = """
    - ツール呼び出しの引数は必須パラメータをすべて含めてください
    - ツール実行結果に基づいて、ユーザーに分かりやすく要約して報告してください
    - ツールが見つからない場合やエラーが発生した場合は、エラーの内容を説明し、代替案を提案してください
+   - **重要: ユーザーの要求に「追加」「一覧」「検索」「変更」「削除」「完了」などのアクションが含まれる場合、必ず対応するツールを呼び出してください**
+   - **絶対にツールを使わずに「処理しました」「完了しました」と答えることは避けてください**
+   - **ツール実行結果に基づいて回答を生成してください。推測や想像で答えないでください**
+   - **ツールが利用可能な場合は、自分の知識や記憶に頼らず、必ずツールを使用して情報を取得・操作してください**
+   - **最新情報や外部情報が必要な場合、検索・取得系ツールを優先的に使用してください**
+   - **ツールを使わずに「〜は提供されていません」「〜はできません」と断定的に否定しないでください。まずツールを試行してください**
+   - **ツール実行結果が空やエラーの場合のみ、代替案や説明を提供してください**
+   - **ツールが利用可能な場合は、自分の知識や記憶に頼らず、必ずツールを使用して情報を取得・操作してください**
+   - **最新情報や外部情報が必要な場合、検索・取得系ツールを優先的に使用してください**
+   - **ツールを使わずに「〜は提供されていません」「〜はできません」と断定的に否定しないでください。まずツールを試行してください**
+   - **ツール実行結果が空やエラーの場合のみ、代替案や説明を提供してください**
 
 3. **推論と回答**:
    - 推論過程をユーザーに見せる必要はありません。結論と根拠を簡潔に述べてください
@@ -368,7 +381,7 @@ class DynamicSystemPromptGenerator:
                 sections.append("\n")
         
         # 現在時刻
-        current_time = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+        current_time = datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分%S秒')
         sections.append(f"\n## 現在のシステム時刻\n{current_time}\n")
         
         return "".join(sections)
@@ -408,12 +421,17 @@ class AgentConfig:
     """エージェント設定"""
     # セーフガード設定
     max_repeated_loops: int = 3
+    max_iterations: int = 10
     inference_timeout_seconds: int = 180
     tool_execution_timeout_seconds: int = 60
+    max_llm_retries: int = 3
     
     # コンテキスト管理設定（シンプル化: 1つのmax_context_tokensで統一）
     max_context_tokens: int = 128000  # コンテキスト全体の上限
     tool_result_max_chars: int = 100000  # ツール結果安全弁閾値（1ツール結果の最大文字数、超過時のみ切り詰め）
+    
+    # ツール定義予算設定
+    tool_definition_budget_ratio: float = 0.25  # max_context_tokensに対するツール定義の割合（デフォルト25%）
     
     # 内部計算用（max_context_tokensから自動導出、直接設定不要）
     hard_limit_tokens: int = field(init=False)
@@ -451,7 +469,8 @@ class AgentConfig:
         # コンテキスト予算の自動配分
         self.hard_limit_tokens = self.max_context_tokens
         self.soft_limit_tokens = int(self.max_context_tokens * 0.75)
-        self.tool_definition_budget_tokens = int(self.max_context_tokens * 0.25)
+        # ツール定義予算: max_context_tokensの指定割合（デフォルト25%）
+        self.tool_definition_budget_tokens = int(self.max_context_tokens * self.tool_definition_budget_ratio)
         self.message_history_budget_tokens = int(self.max_context_tokens * 0.5)
         
         # ツール結果Pruningの自動配分（後方互換・内部計算用）
@@ -474,6 +493,7 @@ class AgentConfig:
         # --- 新設定（シンプル版）の読み込み ---
         max_context_tokens = context_mgmt.get("max_context_tokens")
         tool_result_max_chars = context_mgmt.get("tool_result_max_chars")
+        tool_definition_budget_ratio = context_mgmt.get("tool_definition_budget_ratio")
         
         # --- 旧設定からの自動変換（後方互換） ---
         if max_context_tokens is None:
@@ -499,14 +519,20 @@ class AgentConfig:
             else:
                 tool_result_max_chars = 4000  # デフォルト
         
+        if tool_definition_budget_ratio is None:
+            tool_definition_budget_ratio = 0.25  # デフォルト25%
+        
         return cls(
             # セーフガード
             max_repeated_loops=safeguards.get("max_repeated_loops", 3),
+            max_iterations=safeguards.get("max_iterations", 10),
             inference_timeout_seconds=safeguards.get("inference_timeout_seconds", 180),
             tool_execution_timeout_seconds=safeguards.get("tool_execution_timeout_seconds", 60),
+            max_llm_retries=safeguards.get("max_llm_retries", 3),
             # コンテキスト管理（シンプル版）
             max_context_tokens=max_context_tokens,
             tool_result_max_chars=tool_result_max_chars,
+            tool_definition_budget_ratio=tool_definition_budget_ratio,
             # LLM設定
             base_url=llm_settings.get("base_url", "http://localhost:11434/v1"),
             model_name=llm_settings.get("model_name", "gemma3:latest"),
@@ -813,9 +839,14 @@ class MessageHistory:
         """
         テキストのトークン数を推定
         
-        日本語: 約1.5文字/トークン（一般的な日本語トークナイザーの平均）
+        日本語: 約1.0文字/トークン（SentencePieceベースのモデルではCJKも1文字程度）
         英語: 約4文字/トークン
         混合テキスト: 文字種に応じて重み付け
+        
+        Note: Gemma3, Qwen, Llama3等のSentencePieceベースモデルでは、
+        日本語文字は1文字≒1トークン程度になることが多い。
+        過去の1.5文字/トークンはtiktoken等のBPEベースの推定値であり、
+        ローカルLLMでは過小評価になりがちだった。
         """
         if not text:
             return 0.0
@@ -825,8 +856,8 @@ class MessageHistory:
         japanese_chars = len(re.findall(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\u3400-\u4DBF\u3000-\u303F]', text))
         other_chars = len(text) - japanese_chars
         
-        # 日本語部分は1.5文字/トークン、それ以外は4文字/トークン
-        return (japanese_chars / 1.5) + (other_chars / 4.0)
+        # 日本語部分は1.0文字/トークン、それ以外は4文字/トークン
+        return (japanese_chars / 1.0) + (other_chars / 4.0)
     
     def _summarize_message(self, msg: dict, aggressive: bool = False) -> dict | None:
         """
@@ -913,59 +944,66 @@ class MessageHistory:
         """
         予算内に収まるようメッセージを段階的に圧縮
         
-        戦略（Roo Code方式）:
+        戦略:
         1. system メッセージは常に保持
         2. 最新の user メッセージは常に保持
-        3. 古いメッセージから順に、soft_limit超過時に要約→積極的要約→削除
-        """
-        system_msgs = []
-        latest_user_msg = None
-        protected_msgs = []  # 最新3往復を保護
+        3. 最新3往復分（最大6メッセージ）を保護
+        4. 古いメッセージから順に、段階的に圧縮→削除
+           - まず通常要約（先頭切り詰め）
+           - それでも予算超過なら積極的要約（事実要約）
+           - それでも超過なら削除
+        5. 最後に hard_limit を適用
         
-        # 優先メッセージの分離
+        【修正点】
+        - breakを削除し、要約できたメッセージの次の古いメッセージも処理を継続
+        - 積極圧縮のフラグ管理を廃止し、予算に基づいて各メッセージを個別に判断
+        - 診断ログを強化
+        """
+        # メッセージを分類
+        system_msgs = []
+        other_msgs = []
+        
         for msg in self.messages:
             if msg.get("role") == "system":
                 system_msgs.append(msg)
-            elif msg.get("role") == "user":
-                latest_user_msg = msg  # 最後のuserメッセージを保持
+            else:
+                other_msgs.append(msg)
         
-        # 最新3往復のメッセージを保護（user + assistant + tool）
-        # 末尾から遡って、最新のuserメッセージを起点に3往復分を保護
-        if latest_user_msg:
-            latest_user_idx = None
-            for i, msg in enumerate(self.messages):
-                if msg is latest_user_msg:
-                    latest_user_idx = i
+        # 最新の user メッセージのインデックスを特定
+        latest_user_idx = None
+        for i, msg in enumerate(other_msgs):
+            if msg.get("role") == "user":
+                latest_user_idx = i
+        
+        # 保護メッセージ（最新3往復 = 最新のuserから後ろのメッセージ、最大6件）
+        protected_msgs = []
+        if latest_user_idx is not None:
+            protected_count = 0
+            max_protected = 6  # 3往復分
+            for i in range(latest_user_idx, len(other_msgs)):
+                protected_msgs.append(other_msgs[i])
+                protected_count += 1
+                if protected_count >= max_protected:
                     break
-            
-            if latest_user_idx is not None:
-                # latest_user_msg から後ろのメッセージを保護（最大3往復 = 6メッセージ）
-                # user → assistant → tool → assistant → tool → assistant のパターンを想定
-                protected_count = 0
-                max_protected = 6  # 3往復分
-                for i in range(latest_user_idx, len(self.messages)):
-                    msg = self.messages[i]
-                    if msg not in system_msgs:
-                        protected_msgs.append(msg)
-                        protected_count += 1
-                        if protected_count >= max_protected:
-                            break
         
-        # 残りのメッセージ（古い順）
-        other_msgs = [m for m in self.messages
-                      if m not in system_msgs and m not in protected_msgs]
+        # 圧縮対象メッセージ（古い順）
+        compressible_msgs = [m for m in other_msgs if m not in protected_msgs]
         
-        # 優先メッセージのトークン数
-        priority_tokens = self._estimate_messages_tokens(system_msgs)
-        priority_tokens += self._estimate_messages_tokens(protected_msgs)
+        # 固定メッセージのトークン数
+        fixed_tokens = self._estimate_messages_tokens(system_msgs)
+        fixed_tokens += self._estimate_messages_tokens(protected_msgs)
         
-        # --- Phase 1: 通常要約（soft_limit超過時、古い順に要約） ---
-        remaining_budget = self._soft_limit_tokens - priority_tokens
-        phase1_msgs = []
-        for msg in reversed(other_msgs):
+        # 圧縮対象に使える予算
+        remaining_budget = self._soft_limit_tokens - fixed_tokens
+        
+        # Phase 1: 古いメッセージから順に、段階的に圧縮
+        processed_msgs = []
+        for msg in compressible_msgs:
             msg_tokens = self._estimate_messages_tokens([msg])
+            
             if remaining_budget >= msg_tokens:
-                phase1_msgs.append(msg)
+                # 予算内ならそのまま追加
+                processed_msgs.append(msg)
                 remaining_budget -= msg_tokens
             else:
                 # 予算不足: 通常要約を試行
@@ -973,71 +1011,65 @@ class MessageHistory:
                 if summarized:
                     summarized_tokens = self._estimate_messages_tokens([summarized])
                     if remaining_budget >= summarized_tokens:
-                        phase1_msgs.append(summarized)
+                        processed_msgs.append(summarized)
                         remaining_budget -= summarized_tokens
-                break  # これ以上古いメッセージは追加しない
-        
-        phase1_msgs.reverse()
-        result = system_msgs + phase1_msgs
-        # 保護メッセージを追加（順序を保持）
-        for msg in protected_msgs:
-            if msg not in result:
-                result.append(msg)
-        
-        total = self._estimate_messages_tokens(result)
-        
-        # --- Phase 2: 積極的要約（まだsoft_limit超過なら、古いtool結果を積極的圧縮） ---
-        if total > self._soft_limit_tokens:
-            remaining_budget = self._soft_limit_tokens - priority_tokens
-            phase2_msgs = []
-            aggressive_done = False  # 積極圧縮は1回のみ（最も古い大きいtoolメッセージ）
-            
-            for msg in reversed(other_msgs):
-                msg_tokens = self._estimate_messages_tokens([msg])
+                        continue  # 次のメッセージへ（breakしない！）
                 
-                # まだ予算内ならそのまま追加
-                if remaining_budget >= msg_tokens and not aggressive_done:
-                    phase2_msgs.append(msg)
-                    remaining_budget -= msg_tokens
-                    continue
+                # 通常要約でも予算不足: 積極的要約を試行（toolメッセージのみ）
+                if msg.get("role") == "tool":
+                    aggressive_summary = self._summarize_message(msg, aggressive=True)
+                    if aggressive_summary:
+                        aggressive_tokens = self._estimate_messages_tokens([aggressive_summary])
+                        if remaining_budget >= aggressive_tokens:
+                            processed_msgs.append(aggressive_summary)
+                            remaining_budget -= aggressive_tokens
+                            continue  # 次のメッセージへ
                 
-                # 予算不足または積極圧縮済み: 要約を試行
-                if not aggressive_done and msg.get("role") == "tool":
-                    # 最も古い大きいtoolメッセージを積極的圧縮
-                    summarized = self._summarize_message(msg, aggressive=True)
-                    if summarized:
-                        summarized_tokens = self._estimate_messages_tokens([summarized])
-                        if remaining_budget >= summarized_tokens:
-                            phase2_msgs.append(summarized)
-                            remaining_budget -= summarized_tokens
-                            aggressive_done = True
-                            continue
-                
-                # 通常要約を試行
-                summarized = self._summarize_message(msg, aggressive=False)
-                if summarized:
-                    summarized_tokens = self._estimate_messages_tokens([summarized])
-                    if remaining_budget >= summarized_tokens:
-                        phase2_msgs.append(summarized)
-                        remaining_budget -= summarized_tokens
-                
-                break  # これ以上古いメッセージは追加しない
-            
-            phase2_msgs.reverse()
-            result = system_msgs + phase2_msgs
-            # 保護メッセージを追加（順序を保持）
-            for msg in protected_msgs:
-                if msg not in result:
-                    result.append(msg)
-            
-            total = self._estimate_messages_tokens(result)
+                # それでも予算不足: tool_callsを含むassistantメッセージは構造保持
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    minimal_msg = {
+                        "role": "assistant",
+                        "content": "[ツール呼び出し: 詳細は省略]",
+                        "tool_calls": msg.get("tool_calls", [])
+                    }
+                    minimal_tokens = self._estimate_messages_tokens([minimal_msg])
+                    if remaining_budget >= minimal_tokens:
+                        processed_msgs.append(minimal_msg)
+                        remaining_budget -= minimal_tokens
+                # それ以外は削除（ループを継続して次のメッセージを試行）
         
-        # --- Phase 3: hard_limit適用（それでも超過なら古いメッセージから削除） ---
-        if total > self._hard_limit_tokens:
+        # 結果を構築: system + 圧縮済み古いメッセージ + 保護メッセージ
+        result = system_msgs + processed_msgs + protected_msgs
+        
+        # Phase 2: hard_limit適用（それでも超過なら古いメッセージから削除）
+        total_tokens = self._estimate_messages_tokens(result)
+        if total_tokens > self._hard_limit_tokens:
+            # protected_msgsの先頭がuserメッセージの場合はそれをlatest_userとして渡す
+            latest_user_msg = protected_msgs[0] if protected_msgs and protected_msgs[0].get("role") == "user" else None
             result = self._enforce_hard_limit(result, system_msgs, latest_user_msg)
         
-        logger.info(f"コンテキスト予算トリミング: {self._estimate_total_tokens()} -> "
-                    f"{self._estimate_messages_tokens(result)} トークン")
+        # 診断ログ強化
+        original_tokens = self._estimate_total_tokens()
+        final_tokens = self._estimate_messages_tokens(result)
+        removed_count = len(self.messages) - len(result)
+        
+        # 圧縮/削除されたメッセージの詳細をログ
+        compressed_details = []
+        for i, msg in enumerate(self.messages):
+            if msg not in result:
+                role = msg.get("role", "unknown")
+                content_preview = ""
+                if isinstance(msg.get("content"), str):
+                    content_preview = msg["content"][:30].replace("\n", " ")
+                compressed_details.append(f"[{i}]{role}:{content_preview}...")
+        
+        logger.info(
+            f"コンテキスト圧縮: {original_tokens}→{final_tokens}トoken "
+            f"({removed_count}件のメッセージを圧縮/削除, "
+            f"予算: soft={self._soft_limit_tokens}, hard={self._hard_limit_tokens})"
+        )
+        if compressed_details:
+            logger.debug(f"圧縮/削除されたメッセージ: {' | '.join(compressed_details[:10])}")
         
         return result
     
@@ -1133,7 +1165,7 @@ class Agent:
         self._dynamic_prompt_generated = False  # 動的プロンプト生成済みフラグ
         
         # 初期システムプロンプトを構築（後で動的に更新）
-        current_time = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+        current_time = datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分%S秒')
         initial_prompt = f"""あなたは親切で有能なAIアシスタントです。ユーザーの質問に丁寧かつ正確に回答してください。
 
 ## 行動規範
@@ -1149,6 +1181,13 @@ class Agent:
 - `<thinking>` タグの内容はユーザーには表示されません（内部処理用）
 - 推論内容: ユーザーの意図分析 → 必要な情報の特定 → ツール選択の理由 → 実行計画
 - `</thinking>` タグを閉じた後に、実際のツール呼び出しまたはユーザー応答を行ってください
+- **重要: ユーザーの要求に「追加」「一覧」「検索」「変更」「削除」「完了」などのアクションが含まれる場合、必ず対応するツールを呼び出してください**
+- **絶対にツールを使わずに「処理しました」「完了しました」と答えることは避けてください**
+- **ツール実行結果に基づいて回答を生成してください。推測や想像で答えないでください**
+- **ツールが利用可能な場合は、自分の知識や記憶に頼らず、必ずツールを使用して情報を取得・操作してください**
+- **最新情報や外部情報が必要な場合、検索・取得系ツールを優先的に使用してください**
+- **ツールを使わずに「〜は提供されていません」「〜はできません」と断定的に否定しないでください。まずツールを試行してください**
+- **ツール実行結果が空やエラーの場合のみ、代替案や説明を提供してください**
 
 ## 現在のシステム時刻
 {current_time}
@@ -1171,6 +1210,9 @@ class Agent:
         self._initial_user_input = None  # 初回ユーザー入力保存用（ツールフィルタリング用）
         self._empty_response_retry_count = 0  # 空応答リトライカウンター
         self._max_empty_retries = 3  # 空応答最大リトライ回数
+        self._llm_error_retry_count = 0  # LLM接続エラーリトライカウンター
+        self._tool_expectation_retry_count = 0  # ツール使用期待再試行カウンター
+        self._max_tool_expectation_retries = 1  # ツール使用期待最大再試行回数
         
         logger.info(f"エージェント初期化完了: model={config.model_name}, base_url={config.base_url}")
     
@@ -1192,7 +1234,7 @@ class Agent:
                 dynamic_prompt = await self._prompt_generator.generate(base_prompt)
             else:
                 # シンプルなプロンプト
-                current_time = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+                current_time = datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分%S秒')
                 dynamic_prompt = f"""{base_prompt or 'あなたは親切で有能なAIアシスタントです。'}
 
 ## 現在のシステム時刻
@@ -1208,7 +1250,7 @@ class Agent:
         except Exception as e:
             logger.warning(f"動的プロンプト生成に失敗、デフォルトプロンプトを使用: {e}")
             # フォールバック: 静的プロンプトを使用
-            current_time = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+            current_time = datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分%S秒')
             if self.config.use_enhanced_prompt and self.config.include_tool_guidelines:
                 fallback_prompt = ENHANCED_SYSTEM_PROMPT_TEMPLATE.format(current_time=current_time)
             else:
@@ -1252,12 +1294,17 @@ class Agent:
         self._tool_call_counter.clear()
         self._rejection_occurred = False  # 拒否フラグをリセット
         self._empty_response_retry_count = 0  # 空応答リトライカウンターをリセット
+        self._llm_error_retry_count = 0  # LLM接続エラーリトライカウンターをリセット
+        self._tool_expectation_retry_count = 0  # ツール使用期待再試行カウンターをリセット
+        self._tools_executed_this_turn = False  # 現在のターンでツールが実行されたか
         
         loop_count = 0
-        max_iterations = 10  # 無限ループ防止の安全策
+        max_iterations = self.config.max_iterations  # 無限ループ防止の安全策
         
         while not self._cancel_requested and loop_count < max_iterations and not self._rejection_occurred:
             loop_count += 1
+            # 各推論ターン開始時にツール実行フラグをリセット
+            self._tools_executed_this_turn = False
             logger.info(f"=== 推論ループ {loop_count} 回目 ===")
             
             # ========================================
@@ -1277,6 +1324,15 @@ class Agent:
                         filter_input = self._initial_user_input
                     llm_response = await self._call_llm(user_input=filter_input)
                     
+                    # LLM呼び出し成功時はエラーリトライカウンターをリセット
+                    self._llm_error_retry_count = 0
+                    
+                    # 【追加】空応答リトライで上昇したtemperatureを元に戻す
+                    if hasattr(self, '_original_temperature'):
+                        self.config.temperature = self._original_temperature
+                        logger.info(f"正常応答検知: temperatureを {self.config.temperature} に復元")
+                        delattr(self, '_original_temperature')
+                    
                     # 【診断ログ】LLM応答の詳細を記録
                     logger.debug(f"[診断] LLM応答: content={llm_response.content[:100] if llm_response.content else 'None'}, tool_calls={len(llm_response.tool_calls)}, finish_reason={llm_response.finish_reason}")
                     
@@ -1287,9 +1343,35 @@ class Agent:
                     
                 except Exception as e:
                     logger.error(f"LLM呼び出しエラー: {e}")
-                    step.output = f"エラーが発生しました: {str(e)}"
-                    yield step
-                    break
+                    self._llm_error_retry_count += 1
+                    
+                    if self._llm_error_retry_count < self.config.max_llm_retries:
+                        # リトライ可能: エラー内容を履歴に追加して再推論
+                        retry_msg = f"🔄 LLM接続エラーが発生しました。再試行 {self._llm_error_retry_count}/{self.config.max_llm_retries} 回目です。エラー: {str(e)}"
+                        logger.warning(retry_msg)
+                        step.output = retry_msg
+                        yield step
+                        
+                        # 【修正】エラー内容を履歴に追加（systemメッセージを直接追加せず、assistantメッセージとして追加）
+                        # これにより _trim_to_budget() の保護メッセージ判定に影響を与えない
+                        self.history.add_assistant_message(
+                            f"【システム通知】LLM接続エラーが発生しました。エラー内容: {str(e)}。再度推論を試行してください。"
+                        )
+                        continue  # ループを継続して再推論
+                    else:
+                        # 最大リトライ回数に達した: エラーをユーザーに通知して終了
+                        error_msg = f"❌ LLM接続エラーが{self.config.max_llm_retries}回連続で発生しました。エラー: {str(e)}"
+                        logger.error(error_msg)
+                        step.output = error_msg
+                        yield step
+                        
+                        # エラーメッセージを履歴に追加
+                        self.history.add_assistant_message(error_msg)
+                        
+                        # 最終的なエラーメッセージをユーザーに表示
+                        await cl.Message(content=error_msg).send()
+                        
+                        break  # ループ終了
             
             # ========================================
             # Step 2: ツール実行判定
@@ -1398,14 +1480,16 @@ class Agent:
                         
                         yield tool_step
                 
-                # ツール実行後、LLMがcontentを同時に返していた場合は履歴に追加して継続
-                # （LLMがプレビュー的な応答を含めて返すケース。ツール結果を渡して再度推論させる）
+                # ツール実行後、LLMがcontentを同時に返していた場合の処理
+                # contentはプレビュー/思考メッセージであり、公式な会話履歴に追加しない
+                # 履歴に追加すると次の推論で「既に回答済み」と誤認識されるため
                 if llm_response.content:
-                    logger.info(f"[診断] ツール実行後のcontent応答を検知、履歴に追加: {llm_response.content[:100]}...")
-                    self.history.add_assistant_message(llm_response.content)
-                    # breakを削除 - ツール結果を渡して再度推論させる
+                    logger.info(f"[診断] ツール実行後のcontent応答を検知（履歴には追加しません）: {llm_response.content[:100]}...")
                 
-                # 履歴追加後、再度推論へ（ループ継続）
+                # ツール実行済みフラグをセット（偽陽性防止）
+                self._tools_executed_this_turn = True
+                
+                # ツール結果を渡して再度推論へ（ループ継続）
                 continue
             
             # ========================================
@@ -1413,16 +1497,27 @@ class Agent:
             # ========================================
             if llm_response.content:
                 # 【診断ログ】自然言語応答を検知
-                logger.info(f"[診断] 自然言語応答を検知、ループ終了: {llm_response.content[:100]}...")
+                logger.info(f"[診断] 自然言語応答を検知: {llm_response.content[:100]}...")
+                
+                # 【削除】ツール使用期待再試行機能を廃止
+                # 理由: 偽陽性が高く、空応答を誘発する主要な要因となっていた
+                # システムプロンプトでのツール使用促進で十分なため、追加の再試行メカニズムは不要
+                
                 self.history.add_assistant_message(llm_response.content)
                 
                 async with cl.Step(name="応答") as response_step:
                     response_step.output = llm_response.content
                     yield response_step
                 break  # ループ終了
-            else:
-                # 【診断ログ】自然言語応答なし（異常終了の可能性）
-                logger.warning(f"[診断] 自然言語応答なし、contentが空です。finish_reason={llm_response.finish_reason}")
+            elif not llm_response.tool_calls and llm_response.finish_reason == "stop":
+                # 【診断ログ】自然言語応答なし（空応答）
+                logger.warning(
+                    f"[診断] 自然言語応答なし（空応答）。"
+                    f"finish_reason={llm_response.finish_reason}, "
+                    f"tool_calls={len(llm_response.tool_calls)}, "
+                    f"messages_count={len(self.history.messages)}, "
+                    f"retry_count={self._empty_response_retry_count}"
+                )
                 
                 # ========================================
                 # 空応答リトライ処理
@@ -1436,11 +1531,14 @@ class Agent:
                         retry_step.output = retry_msg
                         yield retry_step
                     
-                    # 履歴に再試行促進メッセージを追加（システムメッセージとして）
-                    self.history.messages.append({
-                        "role": "system",
-                        "content": "【システム通知】前回の応答が空でした。ユーザーの質問に対して必ず回答を生成してください。"
-                    })
+                    # 【修正】空応答リトライ時は履歴にメッセージを追加しない
+                    # 理由: assistantメッセージとして追加すると「assistantがシステム通知を言った」
+                    # という変な文脈になり、LLMの推論を混乱させる
+                    # 同じコンテキストで再推論し、temperatureを少し上げて多様性を持たせる
+                    if not hasattr(self, '_original_temperature'):
+                        self._original_temperature = self.config.temperature
+                    self.config.temperature = min(self.config.temperature + 0.2, 0.8)
+                    logger.info(f"空応答リトライ: temperatureを {self._original_temperature} → {self.config.temperature} に一時的に上昇")
                     
                     # ループを継続して再推論
                     continue
@@ -1460,6 +1558,25 @@ class Agent:
                     await cl.Message(content=error_msg).send()
                     
                     break  # ループ終了
+            else:
+                # その他の異常終了（finish_reasonがstop以外、またはtool_callsがあるのにcontentもない）
+                error_msg = (
+                    f"❌ LLMから予期しない応答を受信しました。"
+                    f"(finish_reason={llm_response.finish_reason}, "
+                    f"tool_calls={len(llm_response.tool_calls)}, "
+                    f"content={'あり' if llm_response.content else 'なし'})"
+                )
+                logger.error(error_msg)
+                
+                async with cl.Step(name="❌ 異常応答検知") as error_step:
+                    error_step.output = error_msg
+                    yield error_step
+                
+                # エラーメッセージを履歴に追加
+                self.history.add_assistant_message(error_msg)
+                await cl.Message(content=error_msg).send()
+                
+                break  # ループ終了
         
         if loop_count >= max_iterations:
             async with cl.Step(name="⚠️ 最大反復回数") as warn_step:
@@ -1582,16 +1699,22 @@ class Agent:
         """
         # ツール定義を取得（フィルタリング設定を適用）
         # サーバー名が指定されている場合は該当サーバーのツールのみを取得
+        # ツール定義予算を渡して動的調整を有効化
         tools = await self.mcp_manager.get_tools_for_llm(
             user_input=user_input,
             max_tools=self.config.max_tools if self.config.tool_filter_enabled else None,
             compression_mode=self.config.compression_mode if self.config.tool_filter_enabled else "full",
             always_include=self.config.always_include if self.config.tool_filter_enabled else None,
-            server_name=getattr(self, '_server_name', None)
+            server_name=getattr(self, '_server_name', None),
+            tool_definition_budget_tokens=self.config.tool_definition_budget_tokens
         )
         
         # リクエストボディを構築
         messages = self.history.get_context_for_llm()
+        
+        # 【修正】システムプロンプト内の時刻を最新のJST時刻に更新
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = self._inject_current_time(messages[0]["content"])
         
         # マルチモーダルメッセージのcontentがリストの場合、OpenAI互換形式に変換
         # 一部のローカルLLM（Ollama等）はimage_urlではなくimageで受け取る場合があるが、
@@ -1607,6 +1730,22 @@ class Agent:
         if tools:
             request_body["tools"] = tools
             request_body["tool_choice"] = "auto"
+        
+        # 【診断】リクエスト全体の推定トークン数を計算してログ出力
+        try:
+            from tools import _estimate_tool_definition_tokens
+            tool_tokens = _estimate_tool_definition_tokens(tools)
+            message_tokens = self.history._estimate_total_tokens()
+            total_estimated = tool_tokens + message_tokens
+            logger.info(
+                f"LLMリクエスト推定トークン数: ツール定義={tool_tokens}, "
+                f"メッセージ履歴={message_tokens}, 合計={total_estimated} "
+                f"（予算: ツール={self.config.tool_definition_budget_tokens}, "
+                f"メッセージ={self.config.message_history_budget_tokens}, "
+                f"全体={self.config.max_context_tokens}）"
+            )
+        except Exception as e:
+            logger.debug(f"リクエストトークン数推定に失敗: {e}")
         
         headers = {
             "Content-Type": "application/json"
@@ -1815,18 +1954,19 @@ class Agent:
     
     def _summarize_tool_result(self, tool_name: str, raw_result: dict) -> str:
         """
-        ツール実行結果の安全弁処理
+        ツール実行結果の安全弁処理と構造化圧縮
         
         原則としてツール結果はそのまま保持し、コンテキスト全体の圧縮は
         MessageHistory._trim_to_budget() で行う。
-        本メソッドは極端に巨大な結果に対する安全弁のみ。
+        本メソッドは極端に巨大な結果に対する安全弁と、
+        構造化データ（JSON、テーブル）の事前圧縮を行う。
         
         Args:
             tool_name: ツール名
             raw_result: 生のツール実行結果
             
         Returns:
-            処理後のテキスト（通常はそのまま）
+            処理後のテキスト
         """
         # 結果からテキストを抽出
         if isinstance(raw_result, dict):
@@ -1842,7 +1982,53 @@ class Agent:
         else:
             result_text = str(raw_result)
         
-        # 安全弁: tool_result_max_chars を超える場合のみ切り詰め
+        # --- 構造化データの事前圧縮 ---
+        
+        # 1. JSON形式のレスポンスを圧縮
+        try:
+            json_data = json.loads(result_text)
+            if isinstance(json_data, dict):
+                # エラーレスポンスの場合は短縮
+                if json_data.get("status") == "error":
+                    error_msg = json_data.get("error", "不明なエラー")
+                    return f"[エラー] {tool_name}: {error_msg[:200]}"
+                
+                # 成功レスポンスで項目数が多い場合は要約
+                if len(str(json_data)) > 2000:
+                    # キーと値の概要のみ保持
+                    keys = list(json_data.keys())[:10]
+                    summary = f"[JSON結果] {tool_name}: キー={', '.join(keys)}"
+                    if len(json_data) > 10:
+                        summary += f" 他{len(json_data) - 10}件"
+                    return summary
+            elif isinstance(json_data, list):
+                # リスト形式の結果を圧縮
+                if len(json_data) > 20:
+                    # 先頭3件と末尾2件のみ保持
+                    preview = json.dumps(json_data[:3], ensure_ascii=False, indent=None)
+                    return f"[リスト結果] {tool_name}: {len(json_data)}件 (先頭3件: {preview[:300]}...)"
+        except (json.JSONDecodeError, ValueError):
+            pass  # JSONでない場合は通常のテキスト処理へ
+        
+        # 2. テーブル形式（Markdownテーブル）の圧縮
+        lines = result_text.split('\n')
+        table_lines = [l for l in lines if l.strip().startswith('|')]
+        if len(table_lines) > 30:
+            # ヘッダー + 先頭10行 + 末尾2行 + 件数表示
+            header = table_lines[0] if table_lines else ""
+            separator = table_lines[1] if len(table_lines) > 1 else ""
+            preview_rows = table_lines[2:12]  # 先頭10行
+            data_rows = table_lines[2:]
+            return f"{header}\n{separator}\n" + "\n".join(preview_rows) + f"\n... [{len(data_rows)}行中先頭10行表示]"
+        
+        # 3. 行数ベースの圧縮（JSON/テーブル以外）
+        if len(lines) > 50:
+            # 先頭30行 + 末尾5行
+            head = "\n".join(lines[:30])
+            tail = "\n".join(lines[-5:])
+            return f"{head}\n... [{len(lines)}行中30行表示]\n{tail}"
+        
+        # 4. 安全弁: tool_result_max_chars を超える場合のみ切り詰め
         safety_limit = self.config.tool_result_max_chars
         
         if len(result_text) > safety_limit:
@@ -1850,6 +2036,32 @@ class Agent:
             return result_text[:safety_limit] + f"\n... [結果が長すぎるため切り詰め: 全{len(result_text)}文字中{safety_limit}文字表示]"
         
         return result_text
+    
+    def _inject_current_time(self, prompt: str) -> str:
+        """
+        システムプロンプト内の時刻を現在のJST時刻で更新
+        
+        Args:
+            prompt: 更新対象のシステムプロンプト
+            
+        Returns:
+            時刻が更新されたプロンプト
+        """
+        import re
+        jst_now = datetime.now(timezone(timedelta(hours=9))).strftime('%Y年%m月%d日 %H時%M分%S秒')
+        
+        # 「現在のシステム時刻」に続く時刻表記を置換
+        # 複数のフォーマットに対応:
+        # - "## 現在のシステム時刻\n2025年05月23日 11時37分50秒"
+        # - "現在のシステム時刻は 2025年05月23日 11時37分50秒 です。"
+        time_pattern = r'(現在のシステム時刻[は:\s]*(?:\n\s*)?)(\d{4}年\d{2}月\d{2}日\s+\d{2}時\d{2}分\d{2}秒)'
+        
+        if re.search(time_pattern, prompt):
+            # \g<1> を使用: \1 の直後に数字が続くと「グループ12026」と誤解釈されるため
+            return re.sub(time_pattern, r'\g<1>' + jst_now, prompt, count=1)
+        
+        # 時刻セクションが見つからない場合は末尾に追加
+        return prompt + f"\n\n## 現在のシステム時刻\n{jst_now}\n"
     
     def _detect_loop(self, tool_calls: list[ToolCall]) -> bool:
         """
@@ -1912,6 +2124,67 @@ class Agent:
                 logger.warning(f"ループ検知（カウンター）: {key} が {self._tool_call_counter[key]}回")
                 return True
         
+        return False
+    
+    async def _should_retry_for_tool_expectation(self, user_input: str, llm_content: str) -> bool:
+        """
+        ツール使用が期待されるが使われなかった場合に再試行すべきかを判定
+        
+        Args:
+            user_input: ユーザー入力テキスト
+            llm_content: LLMの応答テキスト
+            
+        Returns:
+            再試行すべき場合True
+        """
+        # 現在のターンでツールが既に実行されている場合は再試行しない（偽陽性防止）
+        if self._tools_executed_this_turn:
+            logger.debug("ツール使用期待再試行: 現在のターンでツールが既に実行されているためスキップします")
+            return False
+        
+        # 最大再試行回数に達した場合は再試行しない
+        if self._tool_expectation_retry_count >= self._max_tool_expectation_retries:
+            logger.debug(
+                f"ツール使用期待再試行: 最大回数({self._max_tool_expectation_retries})に達したため再試行しません"
+            )
+            return False
+        
+        # ツールフィルタからツール使用期待値を判定
+        from tools import ToolFilter
+        tool_filter = ToolFilter()
+        should_expect, matched_keywords = tool_filter.should_expect_tool_calls(user_input)
+        
+        if not should_expect:
+            logger.debug(f"ツール使用期待再試行: ツール使用は期待されません")
+            return False
+        
+        # 利用可能なツールがあるか確認
+        tools = await self.mcp_manager.get_all_tools()
+        if not tools:
+            logger.debug(f"ツール使用期待再試行: 利用可能なツールがないため再試行しません")
+            return False
+        
+        # LLMの応答に「処理しました」「完了しました」などの虚偽完了表現が含まれるか確認
+        completion_phrases = [
+            "処理しました", "完了しました", "実行しました", "登録しました",
+            "変更しました", "削除しました", "更新しました", "追加しました",
+            "完了", "処理", "実行", "登録", "変更", "削除", "更新", "追加",
+            "しました", "してあります", "しておきました",
+        ]
+        has_completion_phrase = any(phrase in llm_content for phrase in completion_phrases)
+        
+        # ツール使用が期待され、かつ虚偽完了表現がある場合に再試行
+        if has_completion_phrase:
+            logger.warning(
+                f"ツール使用期待再試行: ツール使用が期待されるが虚偽完了表現を検知。"
+                f"keywords={matched_keywords}, content={llm_content[:100]}..."
+            )
+            return True
+        
+        logger.debug(
+            f"ツール使用期待再試行: ツール使用は期待されますが、虚偽完了表現は検知されませんでした。"
+            f"keywords={matched_keywords}"
+        )
         return False
     
     def cancel(self):
