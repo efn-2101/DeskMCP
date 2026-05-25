@@ -282,15 +282,15 @@ class SQLiteDataLayer(BaseDataLayer):
             True（成功シグナル）
         """
         # 【検証ログ】update_thread呼び出し時の状態
-        logger.info(f"=== update_thread 検証ログ ===")
-        logger.info(f"  thread_id: {thread_id}")
-        logger.info(f"  kwargs: {kwargs}")
+        logger.debug(f"=== update_thread 検証ログ ===")
+        logger.debug(f"  thread_id: {thread_id}")
+        logger.debug(f"  kwargs: {kwargs}")
         
         async with aiosqlite.connect(self.db_path) as db:
             # スレッドの存在確認
             cursor = await db.execute("SELECT id FROM threads WHERE id = ?", (thread_id,))
             thread_exists = await cursor.fetchone()
-            logger.info(f"  DB内スレッド存在確認: thread_id={thread_id}, exists={thread_exists is not None}")
+            logger.debug(f"  DB内スレッド存在確認: thread_id={thread_id}, exists={thread_exists is not None}")
             
             if not thread_exists:
                 # スレッドが存在しない場合は警告ログを出力してスキップ
@@ -303,7 +303,7 @@ class SQLiteDataLayer(BaseDataLayer):
             if "metadata" in kwargs and kwargs["metadata"] is not None:
                 await db.execute("UPDATE threads SET metadata = ? WHERE id = ?", (json.dumps(kwargs["metadata"]), thread_id))
             await db.commit()
-            logger.info(f"  スレッド更新成功: thread_id={thread_id}")
+            logger.debug(f"  スレッド更新成功: thread_id={thread_id}")
         return True
     
     async def create_step(self, step_dict: dict):
@@ -330,11 +330,11 @@ class SQLiteDataLayer(BaseDataLayer):
             作成されたステップ情報
         """
         # 【検証ログ】create_step呼び出し時の状態
-        logger.info(f"=== create_step 検証ログ ===")
-        logger.info(f"  step_dict.get('threadId'): {step_dict.get('threadId')}")
-        logger.info(f"  step_dict.get('name'): {step_dict.get('name')}")
-        logger.info(f"  cl.context.session.thread_id: {cl.context.session.thread_id if hasattr(cl.context, 'session') else 'N/A'}")
-        logger.info(f"  cl.user_session.get('thread_id'): {cl.user_session.get('thread_id')}")
+        logger.debug(f"=== create_step 検証ログ ===")
+        logger.debug(f"  step_dict.get('threadId'): {step_dict.get('threadId')}")
+        logger.debug(f"  step_dict.get('name'): {step_dict.get('name')}")
+        logger.debug(f"  cl.context.session.thread_id: {cl.context.session.thread_id if hasattr(cl.context, 'session') else 'N/A'}")
+        logger.debug(f"  cl.user_session.get('thread_id'): {cl.user_session.get('thread_id')}")
         
         # 【変更】アクションメニューやウェルカムメッセージは一時UIのためDBに保存しない
         if step_dict.get("name") in ["ActionMenu", "SystemWelcome"]:
@@ -344,10 +344,10 @@ class SQLiteDataLayer(BaseDataLayer):
         thread_id = step_dict.get("threadId")
         if not thread_id:
             thread_id = cl.context.session.thread_id  # コアから取得
-            logger.info(f"  thread_idをcl.context.sessionから取得: {thread_id}")
+            logger.debug(f"  thread_idをcl.context.sessionから取得: {thread_id}")
             if not thread_id:
                 thread_id = cl.user_session.get("thread_id")
-                logger.info(f"  thread_idをcl.user_sessionから取得: {thread_id}")
+                logger.debug(f"  thread_idをcl.user_sessionから取得: {thread_id}")
                 if not thread_id:
                     logger.warning(f"  thread_idが取得できません。ステップを保存しません。")
                     return step_dict
@@ -365,7 +365,7 @@ class SQLiteDataLayer(BaseDataLayer):
             # 親スレッドが存在しない場合は警告ログを出力してスキップ
             cursor = await db.execute("SELECT id FROM threads WHERE id = ?", (thread_id,))
             thread_exists = await cursor.fetchone()
-            logger.info(f"  DB内スレッド存在確認: thread_id={thread_id}, exists={thread_exists is not None}")
+            logger.debug(f"  DB内スレッド存在確認: thread_id={thread_id}, exists={thread_exists is not None}")
             
             if not thread_exists:
                 # 親スレッドを自動作成（UPSERT）
@@ -388,7 +388,7 @@ class SQLiteDataLayer(BaseDataLayer):
                 )
             )
             await db.commit()
-            logger.info(f"  ステップ保存成功: step_id={step_dict.get('id')}, thread_id={thread_id}")
+            logger.debug(f"  ステップ保存成功: step_id={step_dict.get('id')}, thread_id={thread_id}")
         return step_dict
     
     async def update_step(self, step: Dict[str, Any]) -> Dict[str, Any]:

@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
 DANGEROUS_KEYWORDS = ["create", "update", "delete", "write", "remove", "post", "put", "add", "archive", "clear", "drop", "move"]
 
 # 安全なツールプレフィックス（DANGEROUS_KEYWORDSより優先で承認不要と判定）
-SAFE_TOOL_PREFIXES = ["get_", "list_", "check_", "read_", "fetch_", "search_", "query_", "status"]
+# add_ を追加: add_task, add_tasks_bulk 等はタスク登録・追加で破壊的操作ではない
+SAFE_TOOL_PREFIXES = ["get_", "list_", "check_", "read_", "fetch_", "search_", "query_", "status", "add_"]
 
 # ポーリング系ツールのプレフィックス（ループ検知の閾値を緩和する対象）
 SAFE_POLLING_PREFIXES = ["get_", "list_", "check_", "status", "read_", "fetch_", "query_"]
@@ -93,7 +94,7 @@ def _get_default_config() -> dict:
             "model_name": "gemma3:latest",
             "api_key": "optional_key_here",
             "temperature": 0.2,
-            "max_tokens": 4096
+            "max_tokens": 32768
         },
         "context_management": {
             "max_context_tokens": 128000,
@@ -211,23 +212,25 @@ ENHANCED_SYSTEM_PROMPT_TEMPLATE = """
    - 箇条書きは `- ` または `1. ` を使用してください
    - 重要な注意事項は **太字** で強調してください
 
-2. **ツール使用の原則**:
-   - ユーザーの意図を正確に理解してからツールを選択してください
-   - 複数のツールを順次実行する必要がある場合は、1つずつ順番に呼び出してください
-   - ツール呼び出しの引数は必須パラメータをすべて含めてください
-   - ツール実行結果に基づいて、ユーザーに分かりやすく要約して報告してください
-   - ツールが見つからない場合やエラーが発生した場合は、エラーの内容を説明し、代替案を提案してください
-   - **重要: ユーザーの要求に「追加」「一覧」「検索」「変更」「削除」「完了」などのアクションが含まれる場合、必ず対応するツールを呼び出してください**
-   - **絶対にツールを使わずに「処理しました」「完了しました」と答えることは避けてください**
-   - **ツール実行結果に基づいて回答を生成してください。推測や想像で答えないでください**
-   - **ツールが利用可能な場合は、自分の知識や記憶に頼らず、必ずツールを使用して情報を取得・操作してください**
-   - **最新情報や外部情報が必要な場合、検索・取得系ツールを優先的に使用してください**
-   - **ツールを使わずに「〜は提供されていません」「〜はできません」と断定的に否定しないでください。まずツールを試行してください**
-   - **ツール実行結果が空やエラーの場合のみ、代替案や説明を提供してください**
-   - **ツールが利用可能な場合は、自分の知識や記憶に頼らず、必ずツールを使用して情報を取得・操作してください**
-   - **最新情報や外部情報が必要な場合、検索・取得系ツールを優先的に使用してください**
-   - **ツールを使わずに「〜は提供されていません」「〜はできません」と断定的に否定しないでください。まずツールを試行してください**
-   - **ツール実行結果が空やエラーの場合のみ、代替案や説明を提供してください**
+2. **ツール使用の絶対原則（最優先）**:
+    - **【最重要】ユーザーの要求にタスク操作（追加・一覧・検索・変更・削除・完了）やデータ操作が含まれる場合、必ず対応するツールを呼び出してください**
+    - **【最重要】ツールが利用可能な場合は、自分の知識や記憶に頼らず、必ずツールを使用して情報を取得・操作してください**
+    - **【最重要】絶対にツールを使わずに「処理しました」「完了しました」と答えることは避けてください。自然言語での説明だけで済ませないでください**
+    - **【最重要】ツールを使わずに「〜は提供されていません」「〜はできません」と断定的に否定しないでください。まずツールを試行してください**
+    - ツール実行結果に基づいて回答を生成してください。推測や想像で答えないでください
+    - ツール実行結果が空やエラーの場合のみ、代替案や説明を提供してください
+    - 複数のツールを順次実行する必要がある場合は、1つずつ順番に呼び出してください
+    - ツール呼び出しの引数は必須パラメータをすべて含めてください
+    - ツール実行結果に基づいて、ユーザーに分かりやすく要約して報告してください
+    - ツールが見つからない場合やエラーが発生した場合は、エラーの内容を説明し、代替案を提案してください
+    - 最新情報や外部情報が必要な場合、検索・取得系ツールを優先的に使用してください
+
+3. **ツール結果受取後の行動指針（ループ防止）**:
+    - **ツール実行結果を受け取ったら、まずその内容を評価してください**
+    - **結果が十分であれば、即座にユーザーに回答を生成してください。追加ツールを呼び出さないでください**
+    - **同じツールを同じ引数で繰り返し呼び出さないでください**
+    - **結果が不明確な場合は、ユーザーに確認するか、異なるツールを試行してください**
+    - **ツール呼び出し後は必ず自然言語応答を生成し、ツール結果をユーザーに伝えてください**
 
 3. **推論と回答**:
    - 推論過程をユーザーに見せる必要はありません。結論と根拠を簡潔に述べてください
@@ -451,7 +454,7 @@ class AgentConfig:
     model_name: str = "gemma3:latest"
     api_key: str = "optional_key_here"
     temperature: float = 0.2
-    max_tokens: int = 4096
+    max_tokens: int = 32768
     
     # システムプロンプト設定
     system_prompt: str = "あなたは親切で有能なAIアシスタントです。"
@@ -1181,13 +1184,6 @@ class Agent:
 - `<thinking>` タグの内容はユーザーには表示されません（内部処理用）
 - 推論内容: ユーザーの意図分析 → 必要な情報の特定 → ツール選択の理由 → 実行計画
 - `</thinking>` タグを閉じた後に、実際のツール呼び出しまたはユーザー応答を行ってください
-- **重要: ユーザーの要求に「追加」「一覧」「検索」「変更」「削除」「完了」などのアクションが含まれる場合、必ず対応するツールを呼び出してください**
-- **絶対にツールを使わずに「処理しました」「完了しました」と答えることは避けてください**
-- **ツール実行結果に基づいて回答を生成してください。推測や想像で答えないでください**
-- **ツールが利用可能な場合は、自分の知識や記憶に頼らず、必ずツールを使用して情報を取得・操作してください**
-- **最新情報や外部情報が必要な場合、検索・取得系ツールを優先的に使用してください**
-- **ツールを使わずに「〜は提供されていません」「〜はできません」と断定的に否定しないでください。まずツールを試行してください**
-- **ツール実行結果が空やエラーの場合のみ、代替案や説明を提供してください**
 
 ## 現在のシステム時刻
 {current_time}
@@ -1213,6 +1209,7 @@ class Agent:
         self._llm_error_retry_count = 0  # LLM接続エラーリトライカウンター
         self._tool_expectation_retry_count = 0  # ツール使用期待再試行カウンター
         self._max_tool_expectation_retries = 1  # ツール使用期待最大再試行回数
+        self._length_retry_count = 0  # max_tokens不足リトライカウンター
         
         logger.info(f"エージェント初期化完了: model={config.model_name}, base_url={config.base_url}")
     
@@ -1332,6 +1329,13 @@ class Agent:
                         self.config.temperature = self._original_temperature
                         logger.info(f"正常応答検知: temperatureを {self.config.temperature} に復元")
                         delattr(self, '_original_temperature')
+                    
+                    # 【追加】max_tokens不足リトライで上昇したmax_tokensを元に戻す
+                    if hasattr(self, '_original_max_tokens'):
+                        self.config.max_tokens = self._original_max_tokens
+                        logger.info(f"正常応答検知: max_tokensを {self.config.max_tokens} に復元")
+                        delattr(self, '_original_max_tokens')
+                        self._length_retry_count = 0
                     
                     # 【診断ログ】LLM応答の詳細を記録
                     logger.debug(f"[診断] LLM応答: content={llm_response.content[:100] if llm_response.content else 'None'}, tool_calls={len(llm_response.tool_calls)}, finish_reason={llm_response.finish_reason}")
@@ -1480,14 +1484,29 @@ class Agent:
                         
                         yield tool_step
                 
-                # ツール実行後、LLMがcontentを同時に返していた場合の処理
-                # contentはプレビュー/思考メッセージであり、公式な会話履歴に追加しない
-                # 履歴に追加すると次の推論で「既に回答済み」と誤認識されるため
+                # 【修正】ツール実行後、LLMがcontentを同時に返していた場合の処理
+                # contentには思考・計画テキストが含まれることがあるが、
+                # assistantメッセージとして追加すると次のターンで空応答を誘発するため、
+                # 履歴には追加せずログのみ出力する
                 if llm_response.content:
-                    logger.info(f"[診断] ツール実行後のcontent応答を検知（履歴には追加しません）: {llm_response.content[:100]}...")
+                    logger.info(f"[診断] ツール実行後の思考テキストを検知（履歴には追加しません）: {llm_response.content[:100]}...")
                 
-                # ツール実行済みフラグをセット（偽陽性防止）
+                # 【修正】1ターン1ツール制限で無視されたツール呼び出しはログに記録するのみ
+                # assistantメッセージとして追加すると空応答を誘発するため、履歴には追加しない
+                if len(llm_response.tool_calls) > 1:
+                    skipped_tools = llm_response.tool_calls[1:]
+                    skipped_names = [tc.name for tc in skipped_tools]
+                    logger.info(f"[診断] スキップされたツール呼び出し: {skipped_names}")
+                
+                # ツール実行済みフラグをセット
                 self._tools_executed_this_turn = True
+                
+                # 【修正】ツール実行後、空応答リトライカウンターをリセット
+                # ツール結果を受け取った状態で新しい推論を開始するため、前のターンの空応答カウントは引き継がない
+                self._empty_response_retry_count = 0
+                
+                # 【追加】ツール実行後、max_tokens不足リトライカウンターもリセット
+                self._length_retry_count = 0
                 
                 # ツール結果を渡して再度推論へ（ループ継続）
                 continue
@@ -1509,6 +1528,41 @@ class Agent:
                     response_step.output = llm_response.content
                     yield response_step
                 break  # ループ終了
+            elif not llm_response.tool_calls and llm_response.finish_reason == "length":
+                # 【追加】max_tokens不足で応答が切り詰められた
+                logger.warning(f"[診断] max_tokens不足（finish_reason=length）。現在のmax_tokens={self.config.max_tokens}")
+                
+                if self._length_retry_count < 1:  # 1回までリトライ
+                    self._length_retry_count += 1
+                    # max_tokensを32768に一時的に増加
+                    if not hasattr(self, '_original_max_tokens'):
+                        self._original_max_tokens = self.config.max_tokens
+                    self.config.max_tokens = 65536
+                    logger.info(f"max_tokens不足: {self._original_max_tokens} → {self.config.max_tokens} に一時的に増加")
+                    
+                    retry_msg = "🔄 応答が長すぎて切り詰められました。より大きなmax_tokensで再試行します。"
+                    logger.warning(retry_msg)
+                    
+                    async with cl.Step(name="⚠️ 応答切り詰め検知") as retry_step:
+                        retry_step.output = retry_msg
+                        yield retry_step
+                    
+                    # ループを継続して再推論
+                    continue
+                else:
+                    # 既にリトライ済み
+                    error_msg = "❌ 応答が長すぎて生成できませんでした。より短い要求を試してください。"
+                    logger.error(error_msg)
+                    
+                    async with cl.Step(name="❌ 応答生成失敗") as error_step:
+                        error_step.output = error_msg
+                        yield error_step
+                    
+                    # エラーメッセージを履歴に追加
+                    self.history.add_assistant_message(error_msg)
+                    await cl.Message(content=error_msg).send()
+                    
+                    break  # ループ終了
             elif not llm_response.tool_calls and llm_response.finish_reason == "stop":
                 # 【診断ログ】自然言語応答なし（空応答）
                 logger.warning(
@@ -1531,13 +1585,31 @@ class Agent:
                         retry_step.output = retry_msg
                         yield retry_step
                     
-                    # 【修正】空応答リトライ時は履歴にメッセージを追加しない
-                    # 理由: assistantメッセージとして追加すると「assistantがシステム通知を言った」
-                    # という変な文脈になり、LLMの推論を混乱させる
-                    # 同じコンテキストで再推論し、temperatureを少し上げて多様性を持たせる
+                    # 【修正】空応答リトライ時に、直前のツール結果があれば文脈を保持
+                    # assistantメッセージとして追加すると空応答を誘発するため、
+                    # userメッセージとして追加して「ツール結果を受け取った状態で回答を求める」文脈を保持
+                    last_tool_result = None
+                    last_tool_name = None
+                    for msg in reversed(self.history.messages):
+                        if msg.get("role") == "tool":
+                            last_tool_result = msg.get("content", "")
+                            last_tool_name = msg.get("name", "")
+                            break
+                    
+                    if last_tool_result and last_tool_name:
+                        # ツール結果の要約を含む文脈保持メッセージ
+                        result_summary = last_tool_result[:300] if len(last_tool_result) > 300 else last_tool_result
+                        context_msg = f"【システム: 前回のツール「{last_tool_name}」の実行結果】\n{result_summary}"
+                        if len(last_tool_result) > 300:
+                            context_msg += "..."
+                        # 【修正】userメッセージとして追加（assistantではない）
+                        self.history.add_user_message(context_msg)
+                        logger.info(f"[診断] 空応答リトライ時にツール結果文脈をuserメッセージとして追加: {last_tool_name}")
+                    
+                    # 【修正】temperature上昇幅を0.2→0.1に減らし、過度なランダム性を抑制
                     if not hasattr(self, '_original_temperature'):
                         self._original_temperature = self.config.temperature
-                    self.config.temperature = min(self.config.temperature + 0.2, 0.8)
+                    self.config.temperature = min(self.config.temperature + 0.1, 0.8)
                     logger.info(f"空応答リトライ: temperatureを {self._original_temperature} → {self.config.temperature} に一時的に上昇")
                     
                     # ループを継続して再推論
@@ -1994,19 +2066,31 @@ class Agent:
                     return f"[エラー] {tool_name}: {error_msg[:200]}"
                 
                 # 成功レスポンスで項目数が多い場合は要約
-                if len(str(json_data)) > 2000:
-                    # キーと値の概要のみ保持
-                    keys = list(json_data.keys())[:10]
+                # 圧縮閾値を2000→4000文字に緩和し、重要情報を保持
+                if len(str(json_data)) > 4000:
+                    # キーと値の概要のみ保持（最大15キーまで）
+                    keys = list(json_data.keys())[:15]
                     summary = f"[JSON結果] {tool_name}: キー={', '.join(keys)}"
-                    if len(json_data) > 10:
-                        summary += f" 他{len(json_data) - 10}件"
+                    if len(json_data) > 15:
+                        summary += f" 他{len(json_data) - 15}件"
+                    # 重要なフィールド（status, count, total等）があれば追加
+                    important_fields = ["status", "count", "total", "success", "message"]
+                    for field in important_fields:
+                        if field in json_data:
+                            summary += f"\n{field}={json_data[field]}"
                     return summary
             elif isinstance(json_data, list):
                 # リスト形式の結果を圧縮
-                if len(json_data) > 20:
-                    # 先頭3件と末尾2件のみ保持
-                    preview = json.dumps(json_data[:3], ensure_ascii=False, indent=None)
-                    return f"[リスト結果] {tool_name}: {len(json_data)}件 (先頭3件: {preview[:300]}...)"
+                # 圧縮閾値を20→50件に緩和
+                if len(json_data) > 50:
+                    # 先頭5件と末尾3件のみ保持
+                    preview = json.dumps(json_data[:5], ensure_ascii=False, indent=None)
+                    tail = json.dumps(json_data[-3:], ensure_ascii=False, indent=None)
+                    return f"[リスト結果] {tool_name}: {len(json_data)}件\n先頭5件: {preview[:500]}...\n末尾3件: {tail[:300]}..."
+                elif len(json_data) > 20:
+                    # 中程度のリストは先頭10件を保持
+                    preview = json.dumps(json_data[:10], ensure_ascii=False, indent=None)
+                    return f"[リスト結果] {tool_name}: {len(json_data)}件 (先頭10件: {preview[:800]}...)"
         except (json.JSONDecodeError, ValueError):
             pass  # JSONでない場合は通常のテキスト処理へ
         
@@ -2067,10 +2151,11 @@ class Agent:
         """
         反復ループ検知（仕様書5.3.1）
         
-        3段階の検知を実施:
+        4段階の検知を実施:
         1. 同じツール＋同じ引数の連続呼び出し（厳密一致）
         2. 同じツール名の連続呼び出し（引数違いも検知）
         3. ツール呼び出し総数の上限チェック（ポーリング全般を検知）
+        4. 直前のツール結果後の同ツール名＋同引数の即座再呼び出し
         
         Args:
             tool_calls: 現在のツール呼び出しリスト
@@ -2093,11 +2178,11 @@ class Agent:
             tc_lower = tc.name.lower()
             is_polling_tool = any(tc_lower.startswith(prefix) for prefix in SAFE_POLLING_PREFIXES)
             if is_polling_tool:
-                # ポーリング系は max_repeated_loops * 2 + 1 回まで許容
-                name_threshold = self.config.max_repeated_loops * 2 + 1
+                # ポーリング系は max_repeated_loops * 2 回まで許容（緩和）
+                name_threshold = self.config.max_repeated_loops * 2
             else:
-                # 通常ツールは max_repeated_loops + 1 回まで
-                name_threshold = self.config.max_repeated_loops + 1
+                # 通常ツールは max_repeated_loops 回まで（厳格化）
+                name_threshold = self.config.max_repeated_loops
             
             if self._tool_call_counter[name_key] >= name_threshold:
                 logger.warning(f"ループ検知（ツール名）: {tc.name} が {self._tool_call_counter[name_key]}回呼び出し")
@@ -2109,11 +2194,39 @@ class Agent:
             v for k, v in self._tool_call_counter.items()
             if k.startswith("_name:")
         )
-        # 1セッション中のツール呼び出し総数が max_repeated_loops * 5 を超えたら検知
-        total_threshold = self.config.max_repeated_loops * 5
+        # 1セッション中のツール呼び出し総数が max_repeated_loops * 4 を超えたら検知（緩和）
+        total_threshold = self.config.max_repeated_loops * 4
         if total_calls > total_threshold:
             logger.warning(f"ループ検知（総数）: ツール呼び出し総数 {total_calls} が閾値 {total_threshold} を超過")
             return True
+        
+        # --- 検知4: 直前のツール結果後の同ツール名＋同引数の即座再呼び出し ---
+        # ツール結果後、同じツールを同じ引数で即座に再呼び出しした場合を検知
+        last_tool_name = None
+        last_tool_args = None
+        for msg in reversed(self.history.messages):
+            if msg.get("role") == "tool":
+                last_tool_name = msg.get("name", "")
+                # 直前のassistantメッセージからtool_callsを探す
+                for prev_msg in reversed(self.history.messages):
+                    if prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
+                        for tc_info in prev_msg.get("tool_calls", []):
+                            func = tc_info.get("function", {})
+                            if func.get("name") == last_tool_name:
+                                try:
+                                    last_tool_args = json.loads(func.get("arguments", "{}"))
+                                except (json.JSONDecodeError, ValueError):
+                                    last_tool_args = {}
+                                break
+                        if last_tool_args is not None:
+                            break
+                break
+        
+        if last_tool_name and last_tool_args is not None:
+            for tc in tool_calls:
+                if tc.name == last_tool_name and tc.arguments == last_tool_args:
+                    logger.warning(f"ループ検知（即座再呼び出し）: {tc.name} が直前の結果後に同じ引数で再呼び出し")
+                    return True
         
         # --- 検知1のカウンターベース（厳密一致: ツール名+引数）---
         for tc in tool_calls:
