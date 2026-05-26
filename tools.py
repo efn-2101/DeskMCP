@@ -1263,7 +1263,10 @@ class ToolFilter:
         always_include: List[str] = None,
         server_quota: int = None,
         enable_server_boost: bool = True,
-        use_scoring: bool = True
+        use_scoring: bool = True,
+        priority_ratio: float = 0.5,
+        no_match_strategy: str = "all_tools",
+        empty_input_strategy: str = "round_robin",
     ) -> List[ToolSchema]:
         """
         ユーザー入力に基づいてツールをフィルタリング（スコアリング対応版）
@@ -1283,6 +1286,8 @@ class ToolFilter:
         logger.debug(f"filter_by_user_input: user_input={user_input[:100] if user_input else 'None'}..., all_tools={len(all_tools)}")
         
         if not user_input:
+            if empty_input_strategy == "all_tools":
+                return all_tools[:max_tools]
             return self._apply_round_robin_fallback(all_tools, max_tools)
         
         always_include = always_include or []
@@ -1290,11 +1295,17 @@ class ToolFilter:
         # 新しいスコアリングベースのフィルタリング
         if use_scoring and enable_server_boost:
             return self._filter_with_scoring(
-                user_input, all_tools, max_tools, always_include, server_quota
+                user_input,
+                all_tools,
+                max_tools,
+                always_include,
+                server_quota,
+                priority_ratio,
+                no_match_strategy,
             )
         
         # 従来のフィルタリング（フォールバック）
-        return self._legacy_filter(user_input, all_tools, max_tools, always_include)
+        return self._legacy_filter(user_input, all_tools, max_tools, always_include, no_match_strategy)
     
     def _filter_with_scoring(
         self,
@@ -1302,7 +1313,9 @@ class ToolFilter:
         all_tools: List[ToolSchema],
         max_tools: int,
         always_include: List[str],
-        server_quota: int = None
+        server_quota: int = None,
+        priority_ratio: float = 0.5,
+        no_match_strategy: str = "all_tools",
     ) -> List[ToolSchema]:
         """スコアリングベースのフィルタリング"""
         
@@ -1327,7 +1340,7 @@ class ToolFilter:
         # Step 5: クオータ計算
         min_quota = server_quota if server_quota else max(2, max_tools // max(len(server_names), 1))
         quotas = self.quota_manager.calculate_quotas(
-            server_names, max_tools, priority_server, min_quota=min_quota
+            server_names, max_tools, priority_server, priority_ratio=priority_ratio, min_quota=min_quota
         )
         logger.debug(f"Step3 クオータ計算: {quotas}")
         
@@ -1353,7 +1366,9 @@ class ToolFilter:
         # フォールバック: 結果が空の場合
         if not final_tools and all_tools:
             logger.info(f"スコアリング結果が空のため、ラウンドロビンフォールバックを使用")
-            return self._apply_round_robin_fallback(all_tools, max_tools)
+            if no_match_strategy == "round_robin":
+                return self._apply_round_robin_fallback(all_tools, max_tools)
+            return all_tools[:max_tools]
         
         return final_tools
     
@@ -1362,7 +1377,8 @@ class ToolFilter:
         user_input: str,
         all_tools: List[ToolSchema],
         max_tools: int,
-        always_include: List[str]
+        always_include: List[str],
+        no_match_strategy: str = "all_tools",
     ) -> List[ToolSchema]:
         """従来のフィルタリングロジック（フォールバック用）"""
         
@@ -1399,6 +1415,8 @@ class ToolFilter:
         # フォールバック: マッチするツールがない場合は全ツールから返す
         if not final_tools and all_tools:
             logger.info(f"カテゴリマッチング結果が空のため、全ツールから{max_tools}件を返します")
+            if no_match_strategy == "round_robin":
+                return self._apply_round_robin_fallback(all_tools, max_tools)
             return all_tools[:max_tools]
         
         return final_tools
@@ -1728,15 +1746,15 @@ def _minimize_schema_for_llm(schema: dict) -> dict:
     result = {}
     if "type" in resolved:
         result["type"] = resolved["type"]
+    if "description" in resolved:
+        result["description"] = resolved["description"]
     if "enum" in resolved:
         result["enum"] = resolved["enum"]
     if "properties" in resolved and isinstance(resolved["properties"], dict):
         new_props = {}
         for key, prop in resolved["properties"].items():
             minimized = _minimize_schema_for_llm(prop)
-            if isinstance(minimized, dict):
-                minimized.pop("description", None)
-                minimized.pop("title", None)
+            # descriptionとtitleはLLMの引数理解に重要なため保持する
             new_props[key] = minimized
         result["properties"] = new_props
     if "items" in resolved and isinstance(resolved["items"], dict):
@@ -1870,7 +1888,7 @@ class DefaultParameterValueGenerator:
         required = tool_schema.get("required", [])
         
         for param_name in required:
-            if param_name not in result or result[param_name] is None:
+            if param_name not in result or result.get(param_name) is None:
                 if param_name in properties:
                     result[param_name] = DefaultParameterValueGenerator.generate_default_value(properties[param_name])
                     logger.info(f"[{tool_name}] 必須パラメータ '{param_name}' にデフォルト値を設定: {result[param_name]}")
@@ -2340,6 +2358,28 @@ class MCPServerConnection:
         except Exception as e:
             logger.warning(f"切断エラー ({self.config.name}): {e}")
     
+    def _try_parse_json_string(self, value: str) -> Any:
+        """
+        JSON文字列をパースしてPythonオブジェクトに変換するヘルパー
+        
+        LLMがobject型の引数をJSON文字列として渡した場合に、
+        それをdict/list等に変換して正しく処理できるようにする。
+        
+        Args:
+            value: パース対象の文字列
+            
+        Returns:
+            パース結果（dict, list, str, int, float, bool, None）
+            パース失敗時は元の文字列を返す
+        """
+        if not isinstance(value, str) or not value.strip():
+            return value
+        try:
+            parsed = json.loads(value.strip())
+            return parsed
+        except (json.JSONDecodeError, ValueError):
+            return value
+    
     def _normalize_arguments(self, arguments: dict, tool_name: str = None) -> dict:
         """
         引数をinput_schemaに基づいて正規化
@@ -2392,12 +2432,17 @@ class MCPServerConnection:
                     logger.info(f"[正規化] 必須引数 '{key}' が未指定のため空オブジェクトで初期化")
                     normalized[key] = self._normalize_nested_object({}, resolved_schema)
                 elif isinstance(value, str):
-                    # 文字列の場合は空オブジェクトに変換
-                    if value.strip():
+                    # 文字列の場合、JSONとしてパースを試みる
+                    parsed = self._try_parse_json_string(value)
+                    if isinstance(parsed, dict):
+                        logger.info(f"[正規化] 引数 '{key}' のJSON文字列をdictにパース: {parsed}")
+                        normalized[key] = self._normalize_nested_object(parsed, resolved_schema)
+                    elif value.strip():
                         logger.info(f"[正規化] 引数 '{key}' を空オブジェクトに変換 (元の値: 文字列'{value}')")
+                        normalized[key] = self._normalize_nested_object({}, resolved_schema)
                     else:
                         logger.info(f"[正規化] 引数 '{key}' を空オブジェクトに変換 (元の値: 空文字)")
-                    normalized[key] = self._normalize_nested_object({}, resolved_schema)
+                        normalized[key] = self._normalize_nested_object({}, resolved_schema)
                 elif isinstance(value, dict):
                     # 辞書の場合は再帰的に正規化
                     normalized[key] = self._normalize_nested_object(value, resolved_schema)
@@ -2459,6 +2504,11 @@ class MCPServerConnection:
                 return {}
             elif isinstance(value, dict):
                 return self._normalize_nested_object(value, resolved_schema)
+            elif isinstance(value, str):
+                parsed = self._try_parse_json_string(value)
+                if isinstance(parsed, dict):
+                    return self._normalize_nested_object(parsed, resolved_schema)
+                return {}
             else:
                 return value
         elif resolved_type in ("array",):
@@ -2542,6 +2592,12 @@ class MCPServerConnection:
                 elif isinstance(value, dict):
                     # 再帰的に処理
                     normalized[key] = self._normalize_nested_object(value, resolved_schema)
+                elif isinstance(value, str):
+                    parsed = self._try_parse_json_string(value)
+                    if isinstance(parsed, dict):
+                        normalized[key] = self._normalize_nested_object(parsed, resolved_schema)
+                    else:
+                        normalized[key] = {}
                 else:
                     normalized[key] = value
             elif resolved_type == "string":
@@ -2763,6 +2819,12 @@ class MCPClientManager:
             scoring_config_path=scoring_config_path
         )
         self._tool_filter_settings = tool_filter_settings or {}
+        scoring_weights = self._tool_filter_settings.get("scoring", {}).get("weights", {})
+        if scoring_weights:
+            self._tool_filter.tool_scorer.WEIGHTS = {
+                **self._tool_filter.tool_scorer.WEIGHTS,
+                **scoring_weights,
+            }
         self._server_keywords: dict = {}  # サーバ固有キーワード設定
     
     # ============================================
@@ -2870,6 +2932,15 @@ class MCPClientManager:
         max_tools_limit = max_tools or settings.get("max_tools", 15)
         comp_mode = compression_mode or settings.get("compression_mode", "compact")
         always_include_list = always_include if always_include is not None else settings.get("always_include", [])
+        server_priority = settings.get("server_priority", {})
+        fallback = settings.get("fallback", {})
+        default_quota_ratio = server_priority.get("default_quota_ratio", 0.5)
+        priority_boost_factor = server_priority.get("priority_boost_factor", 1.0)
+        priority_ratio = max(0.0, min(1.0, default_quota_ratio * priority_boost_factor))
+        min_quota = server_priority.get("min_quota_per_server")
+        enable_server_boost = server_priority.get("enabled", True)
+        no_match_strategy = fallback.get("no_match_strategy", "all_tools")
+        empty_input_strategy = fallback.get("empty_input_strategy", "round_robin")
         
         logger.debug(f"設定値: filter_enabled={filter_enabled}, max_tools_limit={max_tools_limit}, always_include={always_include_list}")
         
@@ -2880,7 +2951,12 @@ class MCPClientManager:
                 user_input,
                 all_tools,
                 max_tools=max_tools_limit,
-                always_include=always_include_list
+                always_include=always_include_list,
+                server_quota=min_quota,
+                enable_server_boost=enable_server_boost,
+                priority_ratio=priority_ratio,
+                no_match_strategy=no_match_strategy,
+                empty_input_strategy=empty_input_strategy,
             )
         else:
             filtered_tools = all_tools[:max_tools_limit] if max_tools_limit else all_tools
@@ -2921,7 +2997,12 @@ class MCPClientManager:
                         user_input,
                         all_tools,
                         max_tools=current_max_tools,
-                        always_include=always_include_list
+                        always_include=always_include_list,
+                        server_quota=min_quota,
+                        enable_server_boost=enable_server_boost,
+                        priority_ratio=priority_ratio,
+                        no_match_strategy=no_match_strategy,
+                        empty_input_strategy=empty_input_strategy,
                     )
                 else:
                     filtered_tools = all_tools[:current_max_tools] if current_max_tools else all_tools

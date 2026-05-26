@@ -978,19 +978,21 @@ class MessageHistory:
             if msg.get("role") == "user":
                 latest_user_idx = i
         
-        # 保護メッセージ（最新3往復 = 最新のuserから後ろのメッセージ、最大6件）
+        # 保護メッセージ（最新user以降の直近文脈）
+        # tool_calls と tool result は OpenAI 互換履歴で対になるため、
+        # 先頭から6件ではなく末尾側を優先して最新のツール結果を守る。
         protected_msgs = []
         if latest_user_idx is not None:
-            protected_count = 0
-            max_protected = 6  # 3往復分
-            for i in range(latest_user_idx, len(other_msgs)):
-                protected_msgs.append(other_msgs[i])
-                protected_count += 1
-                if protected_count >= max_protected:
-                    break
+            latest_turn_msgs = other_msgs[latest_user_idx:]
+            max_protected = 8
+            protected_msgs = [latest_turn_msgs[0]]
+            if len(latest_turn_msgs) > 1:
+                protected_msgs.extend(latest_turn_msgs[-(max_protected - 1):])
+            protected_msgs = self._expand_tool_pair_protection(other_msgs, protected_msgs)
         
         # 圧縮対象メッセージ（古い順）
-        compressible_msgs = [m for m in other_msgs if m not in protected_msgs]
+        protected_ids = {id(m) for m in protected_msgs}
+        compressible_msgs = [m for m in other_msgs if id(m) not in protected_ids]
         
         # 固定メッセージのトークン数
         fixed_tokens = self._estimate_messages_tokens(system_msgs)
@@ -1028,21 +1030,10 @@ class MessageHistory:
                             remaining_budget -= aggressive_tokens
                             continue  # 次のメッセージへ
                 
-                # それでも予算不足: tool_callsを含むassistantメッセージは構造保持
-                if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                    minimal_msg = {
-                        "role": "assistant",
-                        "content": "[ツール呼び出し: 詳細は省略]",
-                        "tool_calls": msg.get("tool_calls", [])
-                    }
-                    minimal_tokens = self._estimate_messages_tokens([minimal_msg])
-                    if remaining_budget >= minimal_tokens:
-                        processed_msgs.append(minimal_msg)
-                        remaining_budget -= minimal_tokens
                 # それ以外は削除（ループを継続して次のメッセージを試行）
         
         # 結果を構築: system + 圧縮済み古いメッセージ + 保護メッセージ
-        result = system_msgs + processed_msgs + protected_msgs
+        result = self._repair_tool_message_pairs(system_msgs + processed_msgs + protected_msgs)
         
         # Phase 2: hard_limit適用（それでも超過なら古いメッセージから削除）
         total_tokens = self._estimate_messages_tokens(result)
@@ -1050,6 +1041,7 @@ class MessageHistory:
             # protected_msgsの先頭がuserメッセージの場合はそれをlatest_userとして渡す
             latest_user_msg = protected_msgs[0] if protected_msgs and protected_msgs[0].get("role") == "user" else None
             result = self._enforce_hard_limit(result, system_msgs, latest_user_msg)
+            result = self._repair_tool_message_pairs(result)
         
         # 診断ログ強化
         original_tokens = self._estimate_total_tokens()
@@ -1075,6 +1067,66 @@ class MessageHistory:
             logger.debug(f"圧縮/削除されたメッセージ: {' | '.join(compressed_details[:10])}")
         
         return result
+    
+    def _expand_tool_pair_protection(self, all_msgs: list[dict], protected_msgs: list[dict]) -> list[dict]:
+        """保護対象に含まれる tool_call/tool_result の対応相手も保護する"""
+        protected_ids = {id(m) for m in protected_msgs}
+        wanted_tool_call_ids = set()
+        
+        for msg in protected_msgs:
+            if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                wanted_tool_call_ids.add(msg.get("tool_call_id"))
+            for tc in msg.get("tool_calls", []) or []:
+                if tc.get("id"):
+                    wanted_tool_call_ids.add(tc.get("id"))
+        
+        if not wanted_tool_call_ids:
+            return protected_msgs
+        
+        expanded = []
+        for msg in all_msgs:
+            include = id(msg) in protected_ids
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                ids = {tc.get("id") for tc in msg.get("tool_calls", []) if tc.get("id")}
+                include = include or bool(ids & wanted_tool_call_ids)
+            elif msg.get("role") == "tool":
+                include = include or msg.get("tool_call_id") in wanted_tool_call_ids
+            
+            if include:
+                expanded.append(msg)
+        
+        return expanded
+    
+    def _repair_tool_message_pairs(self, messages: list[dict]) -> list[dict]:
+        """assistant(tool_calls) と tool(result) の片割れだけが残らないように整える"""
+        tool_result_ids = {
+            msg.get("tool_call_id")
+            for msg in messages
+            if msg.get("role") == "tool" and msg.get("tool_call_id")
+        }
+        
+        kept = []
+        pending_tool_ids = set()
+        for msg in messages:
+            role = msg.get("role")
+            if role == "assistant" and msg.get("tool_calls"):
+                call_ids = {tc.get("id") for tc in msg.get("tool_calls", []) if tc.get("id")}
+                if call_ids and call_ids.issubset(tool_result_ids):
+                    kept.append(msg)
+                    pending_tool_ids.update(call_ids)
+                else:
+                    logger.debug("コンテキスト圧縮: 対応するtool結果がないassistant(tool_calls)を除外")
+            elif role == "tool":
+                tool_call_id = msg.get("tool_call_id")
+                if tool_call_id in pending_tool_ids:
+                    kept.append(msg)
+                    pending_tool_ids.discard(tool_call_id)
+                else:
+                    logger.debug("コンテキスト圧縮: 対応するassistant(tool_calls)がないtool結果を除外")
+            else:
+                kept.append(msg)
+        
+        return kept
     
     def _enforce_hard_limit(self, messages: list, system_msgs: list, latest_user_msg: dict | None) -> list:
         """hard_limitを強制適用: system + latest_user以外の古いメッセージから削除"""
@@ -1289,6 +1341,7 @@ class Agent:
         self.history.add_user_message(user_content)
         self._cancel_requested = False
         self._tool_call_counter.clear()
+        self.history.clear_tool_call_history()
         self._rejection_occurred = False  # 拒否フラグをリセット
         self._empty_response_retry_count = 0  # 空応答リトライカウンターをリセット
         self._llm_error_retry_count = 0  # LLM接続エラーリトライカウンターをリセット
@@ -1514,21 +1567,7 @@ class Agent:
             # ========================================
             # ツール呼び出しなし → 自然言語応答
             # ========================================
-            if llm_response.content:
-                # 【診断ログ】自然言語応答を検知
-                logger.info(f"[診断] 自然言語応答を検知: {llm_response.content[:100]}...")
-                
-                # 【削除】ツール使用期待再試行機能を廃止
-                # 理由: 偽陽性が高く、空応答を誘発する主要な要因となっていた
-                # システムプロンプトでのツール使用促進で十分なため、追加の再試行メカニズムは不要
-                
-                self.history.add_assistant_message(llm_response.content)
-                
-                async with cl.Step(name="応答") as response_step:
-                    response_step.output = llm_response.content
-                    yield response_step
-                break  # ループ終了
-            elif not llm_response.tool_calls and llm_response.finish_reason == "length":
+            if not llm_response.tool_calls and llm_response.finish_reason == "length":
                 # 【追加】max_tokens不足で応答が切り詰められた
                 logger.warning(f"[診断] max_tokens不足（finish_reason=length）。現在のmax_tokens={self.config.max_tokens}")
                 
@@ -1563,6 +1602,20 @@ class Agent:
                     await cl.Message(content=error_msg).send()
                     
                     break  # ループ終了
+            elif llm_response.content:
+                # 【診断ログ】自然言語応答を検知
+                logger.info(f"[診断] 自然言語応答を検知: {llm_response.content[:100]}...")
+                
+                # 【削除】ツール使用期待再試行機能を廃止
+                # 理由: 偽陽性が高く、空応答を誘発する主要な要因となっていた
+                # システムプロンプトでのツール使用促進で十分なため、追加の再試行メカニズムは不要
+                
+                self.history.add_assistant_message(llm_response.content)
+                
+                async with cl.Step(name="応答") as response_step:
+                    response_step.output = llm_response.content
+                    yield response_step
+                break  # ループ終了
             elif not llm_response.tool_calls and llm_response.finish_reason == "stop":
                 # 【診断ログ】自然言語応答なし（空応答）
                 logger.warning(
@@ -1570,7 +1623,8 @@ class Agent:
                     f"finish_reason={llm_response.finish_reason}, "
                     f"tool_calls={len(llm_response.tool_calls)}, "
                     f"messages_count={len(self.history.messages)}, "
-                    f"retry_count={self._empty_response_retry_count}"
+                    f"retry_count={self._empty_response_retry_count}, "
+                    f"thinking_len={len(llm_response.thinking)}"
                 )
                 
                 # ========================================
@@ -1605,6 +1659,13 @@ class Agent:
                         # 【修正】userメッセージとして追加（assistantではない）
                         self.history.add_user_message(context_msg)
                         logger.info(f"[診断] 空応答リトライ時にツール結果文脈をuserメッセージとして追加: {last_tool_name}")
+                    
+                    if llm_response.thinking:
+                        self.history.add_user_message(
+                            "【システム通知】前回のLLM応答は内部推論のみで、ユーザーに返す本文やツール呼び出しがありませんでした。"
+                            "内部推論を続けず、最終回答本文または必要なツール呼び出しだけを返してください。"
+                        )
+                        logger.info("[診断] reasoning/thinkingのみの空応答に対する最終回答要求を追加")
                     
                     # 【修正】temperature上昇幅を0.2→0.1に減らし、過度なランダム性を抑制
                     if not hasattr(self, '_original_temperature'):
@@ -1855,8 +1916,9 @@ class Agent:
                 raise Exception(f"LLM API エラー: {e.response.status_code}")
             
             except httpx.RequestError as e:
-                logger.error(f"LLM API 接続エラー: {e}")
-                raise Exception(f"LLM接続エラー: {str(e)}")
+                error_detail = f"{type(e).__name__}: {repr(e)}"
+                logger.error(f"LLM API 接続エラー: {error_detail}")
+                raise Exception(f"LLM接続エラー: {error_detail}")
     
     def _parse_llm_response(self, data: dict) -> LLMResponse:
         """
@@ -1878,18 +1940,39 @@ class Agent:
         finish_reason = choice.get("finish_reason", "stop")
         
         # コンテンツを取得
-        raw_content = message.get("content", "")
+        raw_content = message.get("content") or ""
+        raw_reasoning = (
+            message.get("reasoning")
+            or message.get("reasoning_content")
+            or choice.get("reasoning")
+            or ""
+        )
         
         # <thinking> タグの抽出
-        thinking = ""
+        thinking_parts = []
         content = raw_content
         import re
         thinking_match = re.search(r'<thinking>(.*?)</thinking>', raw_content, re.DOTALL)
         if thinking_match:
-            thinking = thinking_match.group(1).strip()
+            thinking_parts.append(thinking_match.group(1).strip())
             # thinkingタグを除去したコンテンツ
             content = re.sub(r'<thinking>.*?</thinking>', '', raw_content, flags=re.DOTALL).strip()
+        else:
+            content = raw_content.strip() if isinstance(raw_content, str) else ""
+        
+        if raw_reasoning:
+            # Ollama/OpenAI互換APIの一部モデル（Qwen系など）は内部推論を
+            # contentではなくreasoning/reasoning_contentに分離して返す。
+            thinking_parts.append(str(raw_reasoning).strip())
+        
+        thinking = "\n\n".join(part for part in thinking_parts if part)
+        if thinking:
             logger.debug(f"[thinking] 推論内容を抽出: {thinking[:100]}...")
+            if not content and not message.get("tool_calls", []):
+                logger.warning(
+                    "[診断] LLM応答はreasoning/thinkingのみで、content/tool_callsが空です。"
+                    f"finish_reason={finish_reason}, thinking_len={len(thinking)}"
+                )
         
         # ツール呼び出しを取得
         tool_calls = []
@@ -2026,12 +2109,11 @@ class Agent:
     
     def _summarize_tool_result(self, tool_name: str, raw_result: dict) -> str:
         """
-        ツール実行結果の安全弁処理と構造化圧縮
+        ツール実行結果の安全弁処理
         
         原則としてツール結果はそのまま保持し、コンテキスト全体の圧縮は
         MessageHistory._trim_to_budget() で行う。
-        本メソッドは極端に巨大な結果に対する安全弁と、
-        構造化データ（JSON、テーブル）の事前圧縮を行う。
+        本メソッドは極端に巨大な結果に対する安全弁のみを提供する。
         
         Args:
             tool_name: ツール名
@@ -2054,65 +2136,7 @@ class Agent:
         else:
             result_text = str(raw_result)
         
-        # --- 構造化データの事前圧縮 ---
-        
-        # 1. JSON形式のレスポンスを圧縮
-        try:
-            json_data = json.loads(result_text)
-            if isinstance(json_data, dict):
-                # エラーレスポンスの場合は短縮
-                if json_data.get("status") == "error":
-                    error_msg = json_data.get("error", "不明なエラー")
-                    return f"[エラー] {tool_name}: {error_msg[:200]}"
-                
-                # 成功レスポンスで項目数が多い場合は要約
-                # 圧縮閾値を2000→4000文字に緩和し、重要情報を保持
-                if len(str(json_data)) > 4000:
-                    # キーと値の概要のみ保持（最大15キーまで）
-                    keys = list(json_data.keys())[:15]
-                    summary = f"[JSON結果] {tool_name}: キー={', '.join(keys)}"
-                    if len(json_data) > 15:
-                        summary += f" 他{len(json_data) - 15}件"
-                    # 重要なフィールド（status, count, total等）があれば追加
-                    important_fields = ["status", "count", "total", "success", "message"]
-                    for field in important_fields:
-                        if field in json_data:
-                            summary += f"\n{field}={json_data[field]}"
-                    return summary
-            elif isinstance(json_data, list):
-                # リスト形式の結果を圧縮
-                # 圧縮閾値を20→50件に緩和
-                if len(json_data) > 50:
-                    # 先頭5件と末尾3件のみ保持
-                    preview = json.dumps(json_data[:5], ensure_ascii=False, indent=None)
-                    tail = json.dumps(json_data[-3:], ensure_ascii=False, indent=None)
-                    return f"[リスト結果] {tool_name}: {len(json_data)}件\n先頭5件: {preview[:500]}...\n末尾3件: {tail[:300]}..."
-                elif len(json_data) > 20:
-                    # 中程度のリストは先頭10件を保持
-                    preview = json.dumps(json_data[:10], ensure_ascii=False, indent=None)
-                    return f"[リスト結果] {tool_name}: {len(json_data)}件 (先頭10件: {preview[:800]}...)"
-        except (json.JSONDecodeError, ValueError):
-            pass  # JSONでない場合は通常のテキスト処理へ
-        
-        # 2. テーブル形式（Markdownテーブル）の圧縮
-        lines = result_text.split('\n')
-        table_lines = [l for l in lines if l.strip().startswith('|')]
-        if len(table_lines) > 30:
-            # ヘッダー + 先頭10行 + 末尾2行 + 件数表示
-            header = table_lines[0] if table_lines else ""
-            separator = table_lines[1] if len(table_lines) > 1 else ""
-            preview_rows = table_lines[2:12]  # 先頭10行
-            data_rows = table_lines[2:]
-            return f"{header}\n{separator}\n" + "\n".join(preview_rows) + f"\n... [{len(data_rows)}行中先頭10行表示]"
-        
-        # 3. 行数ベースの圧縮（JSON/テーブル以外）
-        if len(lines) > 50:
-            # 先頭30行 + 末尾5行
-            head = "\n".join(lines[:30])
-            tail = "\n".join(lines[-5:])
-            return f"{head}\n... [{len(lines)}行中30行表示]\n{tail}"
-        
-        # 4. 安全弁: tool_result_max_chars を超える場合のみ切り詰め
+        # 安全弁: tool_result_max_chars を超える場合のみ切り詰め
         safety_limit = self.config.tool_result_max_chars
         
         if len(result_text) > safety_limit:
