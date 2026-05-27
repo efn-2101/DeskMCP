@@ -2292,6 +2292,14 @@ class MCPServerConnection:
             merged_env = os.environ.copy()
             if self.config.env:
                 merged_env.update(self.config.env)
+            
+            # 【防御的対応】stdioモードでPythonスクリプトを実行する場合、
+            # エンコーディング問題（Non-UTF-8 SyntaxError）を防ぐため
+            # PYTHONIOENCODING を自動設定（既存の値がない場合のみ）
+            if merged_env.get("PYTHONIOENCODING") is None:
+                merged_env["PYTHONIOENCODING"] = "utf-8"
+                logger.debug(f"PYTHONIOENCODING=utf-8 を自動設定しました")
+            
             logger.debug(f"merged_env keys: {list(merged_env.keys())[:10]}...")
             if 'REDMINE_URL' in merged_env:
                 logger.info(f"  REDMINE_URL value: {merged_env.get('REDMINE_URL')}")
@@ -2856,7 +2864,23 @@ class MCPClientManager:
                 await connection.connect()
                 self._connections[config.name] = connection
             except Exception as e:
+                error_msg = str(e)
                 logger.error(f"サーバー '{config.name}' への接続に失敗: {e}")
+                
+                # 【エラーメッセージ改善】エンコーディング問題を検出して具体的なガイダンスを提供
+                if config.transport_type == "stdio" and "Connection closed" in error_msg:
+                    # stdio接続で即座に切断された場合、サーバースクリプトのエンコーディング問題を疑う
+                    logger.warning(
+                        f"サーバー '{config.name}' のstdio接続が即座に切断されました。"
+                        f"サーバースクリプトのエンコーディング問題（Non-UTF-8 SyntaxError）の可能性があります。"
+                        f"対象ファイル: {config.cwd}/{config.args[0] if config.args else config.command}"
+                    )
+                    logger.warning(
+                        f"修正方法: 対象ファイルをUTF-8エンコーディングで保存し直してください。"
+                        f"例: python -c \"import codecs; raw=open('{config.cwd}/{config.args[0] if config.args else ''}','rb').read(); "
+                        f"codecs.open('{config.cwd}/{config.args[0] if config.args else ''}','w','utf-8').write(raw.decode('cp1006','replace'))\""
+                    )
+                
                 # 1つのサーバー接続失敗でも他のサーバーは試行
         
         self._connected = len(self._connections) > 0

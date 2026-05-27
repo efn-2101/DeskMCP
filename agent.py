@@ -229,6 +229,7 @@ ENHANCED_SYSTEM_PROMPT_TEMPLATE = """
     - **ツール実行結果を受け取ったら、まずその内容を評価してください**
     - **結果が十分であれば、即座にユーザーに回答を生成してください。追加ツールを呼び出さないでください**
     - **同じツールを同じ引数で繰り返し呼び出さないでください**
+    - **ただし、異なる引数で同じツールを呼び出す場合や、ユーザーの新しい要求に対して同じツールを呼び出す場合は正当であり許可されます**
     - **結果が不明確な場合は、ユーザーに確認するか、異なるツールを試行してください**
     - **ツール呼び出し後は必ず自然言語応答を生成し、ツール結果をユーザーに伝えてください**
 
@@ -2226,13 +2227,28 @@ class Agent:
         
         # --- 検知4: 直前のツール結果後の同ツール名＋同引数の即座再呼び出し ---
         # ツール結果後、同じツールを同じ引数で即座に再呼び出しした場合を検知
+        # 【修正】最新のユーザーメッセージ以降の履歴のみを対象とし、
+        # 前回の会話（前回のrun呼び出し）のツール結果は無視する
         last_tool_name = None
         last_tool_args = None
-        for msg in reversed(self.history.messages):
+        
+        # 最新のユーザーメッセージのインデックスを特定
+        latest_user_idx = None
+        for i, msg in enumerate(self.history.messages):
+            if msg.get("role") == "user":
+                latest_user_idx = i
+        
+        # 最新のユーザーメッセージ以降の履歴のみを対象とする
+        if latest_user_idx is not None:
+            recent_messages = self.history.messages[latest_user_idx:]
+        else:
+            recent_messages = self.history.messages
+        
+        for msg in reversed(recent_messages):
             if msg.get("role") == "tool":
                 last_tool_name = msg.get("name", "")
-                # 直前のassistantメッセージからtool_callsを探す
-                for prev_msg in reversed(self.history.messages):
+                # 直前のassistantメッセージからtool_callsを探す（recent_messages内のみ）
+                for prev_msg in reversed(recent_messages):
                     if prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
                         for tc_info in prev_msg.get("tool_calls", []):
                             func = tc_info.get("function", {})
