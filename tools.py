@@ -17,6 +17,7 @@ import re
 import fnmatch
 import ipaddress
 import tempfile
+import time
 from typing import Optional, Any, List, Tuple
 from enum import Enum
 from dataclasses import dataclass, field
@@ -960,6 +961,7 @@ class ToolScorer:
         Returns:
             スコア順にソートされたツールリスト
         """
+        score_start = time.perf_counter()
         scored_tools = []
         input_lower = user_input.lower()
         
@@ -1031,7 +1033,12 @@ class ToolScorer:
             ))
         
         # スコア順にソート
-        return sorted(scored_tools, key=lambda x: x.score, reverse=True)
+        sorted_tools = sorted(scored_tools, key=lambda x: x.score, reverse=True)
+        logger.info(
+            f"[計測] ツールスコアリング: all_tools={len(tools)}, "
+            f"estimated_servers={len(estimated_servers)}, elapsed={time.perf_counter() - score_start:.2f}s"
+        )
+        return sorted_tools
     
     def _extract_words(self, text: str) -> List[str]:
         """テキストから単語を抽出"""
@@ -1283,18 +1290,25 @@ class ToolFilter:
         Returns:
             フィルタリングされたツールリスト
         """
+        filter_start = time.perf_counter()
         logger.debug(f"filter_by_user_input: user_input={user_input[:100] if user_input else 'None'}..., all_tools={len(all_tools)}")
         
         if not user_input:
             if empty_input_strategy == "all_tools":
-                return all_tools[:max_tools]
-            return self._apply_round_robin_fallback(all_tools, max_tools)
+                result = all_tools[:max_tools]
+            else:
+                result = self._apply_round_robin_fallback(all_tools, max_tools)
+            logger.info(
+                f"[計測] ツールフィルタ: input_empty=True, all_tools={len(all_tools)}, "
+                f"selected={len(result)}, elapsed={time.perf_counter() - filter_start:.2f}s"
+            )
+            return result
         
         always_include = always_include or []
         
         # 新しいスコアリングベースのフィルタリング
         if use_scoring and enable_server_boost:
-            return self._filter_with_scoring(
+            result = self._filter_with_scoring(
                 user_input,
                 all_tools,
                 max_tools,
@@ -1303,9 +1317,19 @@ class ToolFilter:
                 priority_ratio,
                 no_match_strategy,
             )
+            logger.info(
+                f"[計測] ツールフィルタ: mode=scoring, all_tools={len(all_tools)}, "
+                f"selected={len(result)}, elapsed={time.perf_counter() - filter_start:.2f}s"
+            )
+            return result
         
         # 従来のフィルタリング（フォールバック）
-        return self._legacy_filter(user_input, all_tools, max_tools, always_include, no_match_strategy)
+        result = self._legacy_filter(user_input, all_tools, max_tools, always_include, no_match_strategy)
+        logger.info(
+            f"[計測] ツールフィルタ: mode=legacy, all_tools={len(all_tools)}, "
+            f"selected={len(result)}, elapsed={time.perf_counter() - filter_start:.2f}s"
+        )
+        return result
     
     def _filter_with_scoring(
         self,
@@ -2827,6 +2851,7 @@ class MCPClientManager:
             scoring_config_path=scoring_config_path
         )
         self._tool_filter_settings = tool_filter_settings or {}
+        self._server_connect_timeout_seconds = self._tool_filter_settings.get("server_connect_timeout_seconds", 120)
         scoring_weights = self._tool_filter_settings.get("scoring", {}).get("weights", {})
         if scoring_weights:
             self._tool_filter.tool_scorer.WEIGHTS = {
@@ -2848,6 +2873,7 @@ class MCPClientManager:
             logger.error("MCPパッケージが利用できません。接続をスキップします。")
             raise RuntimeError("MCPパッケージがインストールされていません")
         
+        connect_start = time.perf_counter()
         logger.info("MCPサーバーへの接続を開始します")
         
         # 設定ファイルから読み込み
@@ -2859,13 +2885,38 @@ class MCPClientManager:
         
         # 各サーバーに接続
         for config in configs:
+            server_start = time.perf_counter()
             try:
                 connection = MCPServerConnection(config)
-                await connection.connect()
+                await asyncio.wait_for(
+                    connection.connect(),
+                    timeout=self._server_connect_timeout_seconds
+                )
                 self._connections[config.name] = connection
+                logger.info(
+                    f"[計測] MCPサーバー接続成功: name={config.name}, transport={config.transport_type}, "
+                    f"tools={len(connection.tools)}, elapsed={time.perf_counter() - server_start:.2f}s"
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"サーバー '{config.name}' への接続がタイムアウトしました "
+                    f"({self._server_connect_timeout_seconds}秒)"
+                )
+                try:
+                    await connection.disconnect()
+                except Exception as cleanup_error:
+                    logger.warning(f"タイムアウト後の接続クリーンアップに失敗 ({config.name}): {cleanup_error}")
+                logger.info(
+                    f"[計測] MCPサーバー接続失敗: name={config.name}, transport={config.transport_type}, "
+                    f"reason=timeout, elapsed={time.perf_counter() - server_start:.2f}s"
+                )
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"サーバー '{config.name}' への接続に失敗: {e}")
+                logger.info(
+                    f"[計測] MCPサーバー接続失敗: name={config.name}, transport={config.transport_type}, "
+                    f"elapsed={time.perf_counter() - server_start:.2f}s"
+                )
                 
                 # 【エラーメッセージ改善】エンコーディング問題を検出して具体的なガイダンスを提供
                 if config.transport_type == "stdio" and "Connection closed" in error_msg:
@@ -2884,7 +2935,10 @@ class MCPClientManager:
                 # 1つのサーバー接続失敗でも他のサーバーは試行
         
         self._connected = len(self._connections) > 0
-        logger.info(f"MCPサーバー接続完了: {len(self._connections)}サーバー")
+        logger.info(
+            f"MCPサーバー接続完了: {len(self._connections)}サーバー, "
+            f"elapsed={time.perf_counter() - connect_start:.2f}s"
+        )
     
     async def disconnect_servers(self) -> None:
         """すべてのMCPサーバーとの接続を切断"""
@@ -2938,6 +2992,7 @@ class MCPClientManager:
         Returns:
             OpenAI Tools形式のツール定義リスト
         """
+        build_start = time.perf_counter()
         all_tools = await self.get_all_tools()
         
         logger.debug(f"get_tools_for_llm: user_input={user_input[:100] if user_input else 'None'}..., server_name={server_name}, all_tools={len(all_tools)}")
@@ -2948,7 +3003,12 @@ class MCPClientManager:
             logger.debug(f"サーバー指定フィルタ: {server_name} -> {len(server_tools)}件")
             if not server_tools:
                 logger.warning(f"指定されたサーバー '{server_name}' のツールが見つかりません")
-            return self._build_openai_tools(server_tools, compression_mode or "compact")
+            tools = self._build_openai_tools(server_tools, compression_mode or "compact")
+            logger.info(
+                f"[計測] LLMツール定義構築: server_filter={server_name}, all_tools={len(all_tools)}, "
+                f"selected={len(server_tools)}, openai_tools={len(tools)}, elapsed={time.perf_counter() - build_start:.2f}s"
+            )
+            return tools
         
         # 設定値の取得（引数が指定された場合は引数を優先）
         settings = self._tool_filter_settings
@@ -3043,6 +3103,11 @@ class MCPClientManager:
                 tools = []
         
         logger.info(f"LLMに渡すツール定義: {len(tools)}件（フィルタリング: {filter_enabled}, 圧縮モード: {comp_mode}）")
+        logger.info(
+            f"[計測] LLMツール定義構築: all_tools={len(all_tools)}, filtered={len(filtered_tools)}, "
+            f"openai_tools={len(tools)}, filter_enabled={filter_enabled}, compression={comp_mode}, "
+            f"elapsed={time.perf_counter() - build_start:.2f}s"
+        )
         return tools
     
     def _build_openai_tools(

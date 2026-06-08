@@ -40,6 +40,15 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================
+# 起動・再開時の二重初期化防止
+# ============================================
+# Chainlitはスレッド再開時に on_chat_resume と on_chat_start が短時間で重複発火することがある。
+# MCPサーバ接続は重い処理のため、プロセス内フラグで同時初期化を抑止する。
+_startup_init_lock = asyncio.Lock()
+_resume_in_progress = False
+
+
+# ============================================
 # ファイル添付処理設定
 # ============================================
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
@@ -182,6 +191,25 @@ setup_proxy_bypass()
 # これによりシステムがデータ永続化をONと認識する
 data_layer = SQLiteDataLayer(db_path="data/chat_history.db")
 cl_data._data_layer = data_layer
+
+
+async def _persist_agent_compaction_state(agent: Agent):
+    thread_id = cl.context.session.thread_id if hasattr(cl.context, "session") else None
+    if not thread_id:
+        thread_id = cl.user_session.get("thread_id")
+    if not thread_id or not agent:
+        return
+
+    state = agent.export_compaction_state()
+    if not state.get("conversation_summary"):
+        return
+
+    current_thread = await cl_data._data_layer.get_thread(thread_id)
+    metadata = {}
+    if current_thread:
+        metadata = current_thread.get("metadata") or {}
+    metadata["context_compaction"] = state
+    await cl_data._data_layer.update_thread(thread_id=thread_id, metadata=metadata)
 
 
 # ============================================
@@ -478,48 +506,60 @@ async def _load_visible_macros_from_db():
 
 @cl.on_chat_start
 async def on_chat_start():
+    global _resume_in_progress
     logger.info("=== セッション初期化開始 ===")
-    
-    agent = cl.user_session.get("agent")
-    if agent is not None:
-        agent.history.messages = []
-        agent.history._tool_call_history = []
+
+    if _resume_in_progress:
+        logger.info("スレッド再開処理中のため on_chat_start のMCP初期化をスキップします")
+        return
+
+    existing_agent = cl.user_session.get("agent")
+    if existing_agent is not None:
+        logger.info("既存Agentがセッションに存在するため on_chat_start のMCP初期化をスキップします")
+        return
     
     cl.user_session.set("user", cl.User(identifier="local_user"))
     
-    try:
-        # 【重要】Chainlitのネイティブなスレッド管理に任せるため、手動のcreate_threadやthread_idの上書きは絶対に行わない
-        system_config = load_system_config()
-        tool_filter_settings = system_config.get("tool_filter_settings", {})
-        mcp_manager = MCPClientManager(tool_filter_settings=tool_filter_settings)
-        await mcp_manager.connect_servers()
-        agent_config = AgentConfig.from_dict(system_config)
-        
-        agent = Agent(mcp_manager=mcp_manager, config=agent_config)
-        
-        cl.user_session.set("agent", agent)
-        cl.user_session.set("mcp_manager", mcp_manager)
-        
-        logger.info("セッション初期化完了")
-        await cl.Message(
-            author="SystemWelcome",
-            content="🤖 エージェントを起動しました。何かお手伝いしましょうか？"
-        ).send()
-        
-        # DBからvisible_macrosを事前に復元してからChatSettingsを初期化
-        await _load_visible_macros_from_db()
-        
-        # ChatSettings（歯車メニュー）を初期化
-        await setup_chat_settings()
-        
-        # アクションメニューを表示
-        await send_action_menu()
-        
-    except Exception as e:
-        logger.error(f"セッション初期化エラー: {e}")
-        await cl.Message(
-            content=f"❌ 初期化エラーが発生しました: {str(e)}"
-        ).send()
+    async with _startup_init_lock:
+        if _resume_in_progress:
+            logger.info("初期化ロック取得後にスレッド再開処理を検知したため on_chat_start をスキップします")
+            return
+        if cl.user_session.get("agent") is not None:
+            logger.info("初期化ロック取得後に既存Agentを検知したため on_chat_start をスキップします")
+            return
+
+        try:
+            # 【重要】Chainlitのネイティブなスレッド管理に任せるため、手動のcreate_threadやthread_idの上書きは絶対に行わない
+            system_config = load_system_config()
+            tool_filter_settings = system_config.get("tool_filter_settings", {})
+            mcp_manager = MCPClientManager(tool_filter_settings=tool_filter_settings)
+            await mcp_manager.connect_servers()
+            agent_config = AgentConfig.from_dict(system_config)
+            
+            agent = Agent(mcp_manager=mcp_manager, config=agent_config)
+            cl.user_session.set("agent", agent)
+            cl.user_session.set("mcp_manager", mcp_manager)
+            
+            logger.info("セッション初期化完了")
+            await cl.Message(
+                author="SystemWelcome",
+                content="🤖 エージェントを起動しました。何かお手伝いしましょうか？"
+            ).send()
+            
+            # DBからvisible_macrosを事前に復元してからChatSettingsを初期化
+            await _load_visible_macros_from_db()
+            
+            # ChatSettings（歯車メニュー）を初期化
+            await setup_chat_settings()
+            
+            # アクションメニューを表示
+            await send_action_menu()
+            
+        except Exception as e:
+            logger.error(f"セッション初期化エラー: {e}")
+            await cl.Message(
+                content=f"❌ 初期化エラーが発生しました: {str(e)}"
+            ).send()
 
 
 # ============================================
@@ -527,103 +567,118 @@ async def on_chat_start():
 # ============================================
 @cl.on_chat_resume
 async def on_chat_resume(thread: dict):
+    global _resume_in_progress
     logger.info(f"=== スレッド再開: {thread.get('id')} ===")
+    _resume_in_progress = True
     
-    try:
-        # 1. MCPマネージャーと設定の再初期化
-        system_config = load_system_config()
-        tool_filter_settings = system_config.get("tool_filter_settings", {})
-        mcp_manager = MCPClientManager(tool_filter_settings=tool_filter_settings)
-        await mcp_manager.connect_servers()
-        agent_config = AgentConfig.from_dict(system_config)
-        
-        # 2. 必須引数を渡してAgentを作成（ここがエラーの原因でした）
-        agent = Agent(mcp_manager=mcp_manager, config=agent_config)
-        
-        # 3. セッションへの確実な登録
-        cl.user_session.set("agent", agent)
-        cl.user_session.set("mcp_manager", mcp_manager)
-        cl.user_session.set("thread_id", thread.get("id"))
-        cl.context.session.thread_id = thread.get("id")  # 追加: コアシステムへの同期
-        
-        # 4. 履歴の復元とAgentへの記憶装填
-        steps = await cl_data._data_layer.get_steps(thread.get("id"))
-        restored_messages = []
-        
-        # ツール呼び出しとツール結果のペアを追跡するための辞書
-        pending_tool_calls = {}  # tool_call_id -> tool_call_info
-        
-        for step in steps:
-            step_type = step.get("type", "")
-            step_name = step.get("name", "")
-            step_output = step.get("output", "")
+    async with _startup_init_lock:
+        try:
+            # 1. MCPマネージャーとAgentを準備
+            # on_chat_start が先に初期化済みの場合は、重いMCP再接続をせず既存インスタンスを再利用する。
+            system_config = load_system_config()
+            agent_config = AgentConfig.from_dict(system_config)
+            agent = cl.user_session.get("agent")
+            mcp_manager = cl.user_session.get("mcp_manager")
+
+            if agent is not None and mcp_manager is not None and getattr(mcp_manager, "is_connected", False):
+                logger.info("既存Agent/MCP接続を再利用してスレッドを復元します")
+            else:
+                tool_filter_settings = system_config.get("tool_filter_settings", {})
+                mcp_manager = MCPClientManager(tool_filter_settings=tool_filter_settings)
+                await mcp_manager.connect_servers()
+                agent = Agent(mcp_manager=mcp_manager, config=agent_config)
             
-            if step_type == "user_message":
-                restored_messages.append({"role": "user", "content": step_output})
-            elif step_type == "assistant_message":
-                restored_messages.append({"role": "assistant", "content": step_output})
-            elif step_type == "tool":
-                # ツール実行ステップの処理
-                # Chainlitのステップ名からツール名を抽出（"🛠️ tool_name"形式）
-                tool_name = step_name.replace("🛠️ ", "").strip() if step_name else ""
-                tool_call_id = f"resume_{len(restored_messages)}"
-                
-                # 【重要】直前に assistant + tool_calls メッセージがない場合は挿入
-                # これにより、OpenAI形式の履歴構造（assistant(tool_calls) → tool(result)）を保持
-                if not restored_messages or restored_messages[-1].get("role") != "assistant" or not restored_messages[-1].get("tool_calls"):
-                    restored_messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": tool_call_id,
-                            "type": "function",
-                            "function": {
-                                "name": tool_name,
-                                "arguments": "{}"
-                            }
-                        }]
-                    })
-                
-                # ツール結果メッセージを追加
-                restored_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "name": tool_name,
-                    "content": step_output
-                })
-            elif step_name == "推論":
-                # 推論ステップはスキップ（UI表示用のみ）
-                pass
-            elif step_name == "応答":
-                # 応答ステップはassistantメッセージとして復元（まだ追加されていない場合）
-                if step_output and (not restored_messages or restored_messages[-1].get("role") != "assistant"):
+            # 2. セッションへの確実な登録
+            cl.user_session.set("agent", agent)
+            cl.user_session.set("mcp_manager", mcp_manager)
+            metadata = thread.get("metadata") or {}
+            compaction_state = metadata.get("context_compaction") or {}
+            agent.apply_compaction_state(compaction_state)
+            cl.user_session.set("thread_id", thread.get("id"))
+            cl.context.session.thread_id = thread.get("id")  # 追加: コアシステムへの同期
+        
+            # 4. 履歴の復元とAgentへの記憶装填
+            steps = await cl_data._data_layer.get_steps(thread.get("id"))
+            if compaction_state.get("conversation_summary"):
+                steps = steps[-agent_config.resume_recent_steps:]
+            restored_messages = []
+        
+            # ツール呼び出しとツール結果のペアを追跡するための辞書
+            pending_tool_calls = {}  # tool_call_id -> tool_call_info
+            
+            for step in steps:
+                step_type = step.get("type", "")
+                step_name = step.get("name", "")
+                step_output = step.get("output", "")
+            
+                if step_type == "user_message":
+                    restored_messages.append({"role": "user", "content": step_output})
+                elif step_type == "assistant_message":
                     restored_messages.append({"role": "assistant", "content": step_output})
-        
-        # システムプロンプトを保持しつつ、復元したメッセージを設定
-        if agent.history.messages and agent.history.messages[0].get("role") == "system":
-            system_msg = agent.history.messages[0]
-            agent.history.messages = [system_msg] + restored_messages
-        else:
-            agent.history.messages = restored_messages
-        
-        logger.info(f"履歴復元完了: {len(restored_messages)}件のメッセージ")
-        
-        # 【重要】既存スレッド再開時もDBから最新の表示設定を読み込むため、
-        # 事前にDBから復元してからChatSettingsを初期化
-        await _load_visible_macros_from_db()
-        
-        # ChatSettings（歯車メニュー）を初期化
-        await setup_chat_settings()
-        
-        # アクションメニューを表示（フロントエンドのDOM復元完了を待つため少し遅延させる）
-        await asyncio.sleep(0.5)
-        await send_action_menu()
-        
-    except Exception as e:
-        logger.error(f"スレッド再開エラー: {e}", exc_info=True)
-        await cl.Message(
-            content=f"❌ 会話の復元に失敗しました: {str(e)}"
-        ).send()
+                elif step_type == "tool":
+                    # ツール実行ステップの処理
+                    # Chainlitのステップ名からツール名を抽出（"🛠️ tool_name"形式）
+                    tool_name = step_name.replace("🛠️ ", "").strip() if step_name else ""
+                    tool_call_id = f"resume_{len(restored_messages)}"
+                    
+                    # 【重要】直前に assistant + tool_calls メッセージがない場合は挿入
+                    # これにより、OpenAI形式の履歴構造（assistant(tool_calls) → tool(result)）を保持
+                    if not restored_messages or restored_messages[-1].get("role") != "assistant" or not restored_messages[-1].get("tool_calls"):
+                        restored_messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": tool_call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": "{}"
+                                }
+                            }]
+                        })
+                    
+                    # ツール結果メッセージを追加
+                    restored_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
+                        "content": step_output
+                    })
+                elif step_name == "推論":
+                    # 推論ステップはスキップ（UI表示用のみ）
+                    pass
+                elif step_name == "応答":
+                    # 応答ステップはassistantメッセージとして復元（まだ追加されていない場合）
+                    if step_output and (not restored_messages or restored_messages[-1].get("role") != "assistant"):
+                        restored_messages.append({"role": "assistant", "content": step_output})
+            
+            # システムプロンプトを保持しつつ、復元したメッセージを設定
+            if agent.history.messages and agent.history.messages[0].get("role") == "system":
+                system_msg = agent.history.messages[0]
+                agent.history.messages = [system_msg] + restored_messages
+            else:
+                agent.history.messages = restored_messages
+            
+            logger.info(f"履歴復元完了: {len(restored_messages)}件のメッセージ")
+            
+            # 【重要】既存スレッド再開時もDBから最新の表示設定を読み込むため、
+            # 事前にDBから復元してからChatSettingsを初期化
+            await _load_visible_macros_from_db()
+            
+            # ChatSettings（歯車メニュー）を初期化
+            await setup_chat_settings()
+            
+            # アクションメニューを表示（フロントエンドのDOM復元完了を待つため少し遅延させる）
+            await asyncio.sleep(0.5)
+            await send_action_menu()
+            
+        except Exception as e:
+            logger.error(f"スレッド再開エラー: {e}", exc_info=True)
+            await cl.Message(
+                content=f"❌ 会話の復元に失敗しました: {str(e)}"
+            ).send()
+        finally:
+            _resume_in_progress = False
 
 
 # ============================================
@@ -696,6 +751,10 @@ async def _process_user_input(user_input: str, server_name: str = None, file_att
             content=f"❌ エラーが発生しました: {str(e)}"
         ).send()
     finally:
+        try:
+            await _persist_agent_compaction_state(agent)
+        except Exception as persist_error:
+            logger.warning(f"Failed to persist compaction state: {persist_error}")
         # fire-and-forget: ハンドラを即座に返しストップボタンを消す
         asyncio.create_task(send_action_menu())
 

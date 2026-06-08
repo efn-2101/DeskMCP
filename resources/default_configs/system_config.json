@@ -5,12 +5,17 @@
     "model_name": "qwen3.5:9b",
     "api_key": "optional_key_here",
     "temperature": 0.2,
-    "max_tokens": 32768
+    "max_tokens": 8192
   },
   "context_management": {
-    "max_context_tokens": 128000,
-    "tool_result_max_chars": 100000,
-    "tool_definition_budget_ratio": 0.25
+    "max_context_tokens": 65536,
+    "tool_result_max_chars": 8000,
+    "tool_definition_budget_ratio": 0.15,
+    "compact_trigger_tokens": 48000,
+    "compact_target_tokens": 24000,
+    "recent_history_tokens": 16000,
+    "summary_budget_tokens": 6000,
+    "resume_recent_steps": 80
   },
   "agent_safeguards": {
     "max_repeated_loops": 3,
@@ -20,9 +25,9 @@
   },
   "tool_filter_settings": {
     "enabled": true,
-    "max_tools": 15,
+    "max_tools": 20,
     "always_include": ["get_server_info"],
-    "compression_mode": "full"
+    "compression_mode": "compact"
   },
   "system_prompt_settings": {
     "use_enhanced_prompt": true,

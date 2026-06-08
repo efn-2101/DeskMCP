@@ -15,6 +15,7 @@ import os
 import shutil
 import ipaddress
 import base64
+import time
 from typing import AsyncGenerator, Optional, Any
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -94,11 +95,17 @@ def _get_default_config() -> dict:
             "model_name": "gemma3:latest",
             "api_key": "optional_key_here",
             "temperature": 0.2,
-            "max_tokens": 32768
+            "max_tokens": 8192
         },
         "context_management": {
-            "max_context_tokens": 128000,
-            "tool_result_max_chars": 4000
+            "max_context_tokens": 65536,
+            "tool_result_max_chars": 8000,
+            "tool_definition_budget_ratio": 0.15,
+            "compact_trigger_tokens": 48000,
+            "compact_target_tokens": 24000,
+            "recent_history_tokens": 16000,
+            "summary_budget_tokens": 6000,
+            "resume_recent_steps": 80
         },
         "agent_safeguards": {
             "max_repeated_loops": 3,
@@ -438,6 +445,12 @@ class AgentConfig:
     tool_definition_budget_ratio: float = 0.25  # max_context_tokensに対するツール定義の割合（デフォルト25%）
     
     # 内部計算用（max_context_tokensから自動導出、直接設定不要）
+    compact_trigger_tokens: int = 48000
+    compact_target_tokens: int = 24000
+    recent_history_tokens: int = 16000
+    summary_budget_tokens: int = 6000
+    resume_recent_steps: int = 80
+
     hard_limit_tokens: int = field(init=False)
     soft_limit_tokens: int = field(init=False)
     tool_definition_budget_tokens: int = field(init=False)
@@ -537,6 +550,11 @@ class AgentConfig:
             max_context_tokens=max_context_tokens,
             tool_result_max_chars=tool_result_max_chars,
             tool_definition_budget_ratio=tool_definition_budget_ratio,
+            compact_trigger_tokens=context_mgmt.get("compact_trigger_tokens", 48000),
+            compact_target_tokens=context_mgmt.get("compact_target_tokens", 24000),
+            recent_history_tokens=context_mgmt.get("recent_history_tokens", 16000),
+            summary_budget_tokens=context_mgmt.get("summary_budget_tokens", 6000),
+            resume_recent_steps=context_mgmt.get("resume_recent_steps", 80),
             # LLM設定
             base_url=llm_settings.get("base_url", "http://localhost:11434/v1"),
             model_name=llm_settings.get("model_name", "gemma3:latest"),
@@ -600,6 +618,8 @@ class MessageHistory:
         """
         self.messages: list[dict] = []
         self._system_prompt = system_prompt
+        self.conversation_summary: str = ""
+        self.summary_updated_at: str = ""
         self._tool_call_history: list[dict] = []  # ループ検知用
         
         # コンテキスト予算
@@ -614,6 +634,32 @@ class MessageHistory:
                 "role": "system",
                 "content": system_prompt
             })
+
+    def set_conversation_summary(self, summary: str, updated_at: str = "") -> None:
+        self.conversation_summary = summary or ""
+        self.summary_updated_at = updated_at or ""
+
+    def get_summary_message(self) -> dict | None:
+        if not self.conversation_summary.strip():
+            return None
+        return {
+            "role": "system",
+            "content": (
+                "Long-term conversation summary. Treat this as prior context, "
+                "but prefer the recent messages when there is a conflict.\n\n"
+                f"{self.conversation_summary.strip()}"
+            )
+        }
+
+    def _with_summary_message(self, messages: list[dict]) -> list[dict]:
+        summary_msg = self.get_summary_message()
+        if not summary_msg:
+            return messages.copy()
+
+        result = messages.copy()
+        insert_at = 1 if result and result[0].get("role") == "system" else 0
+        result.insert(insert_at, summary_msg)
+        return result
     
     def add_user_message(self, content: str | list) -> None:
         """
@@ -772,11 +818,11 @@ class MessageHistory:
             OpenAI形式のメッセージリスト
         """
         # 現在の総トークン数を推定
-        total_tokens = self._estimate_total_tokens()
+        total_tokens = self._estimate_messages_tokens(self._with_summary_message(self.messages))
         
         # 予算内ならそのまま返す
         if total_tokens <= self._soft_limit_tokens:
-            return self.messages.copy()
+            return self._with_summary_message(self.messages)
         
         # 予算超過時のトリミング
         return self._trim_to_budget()
@@ -972,6 +1018,10 @@ class MessageHistory:
                 system_msgs.append(msg)
             else:
                 other_msgs.append(msg)
+
+        summary_msg = self.get_summary_message()
+        if summary_msg:
+            system_msgs.append(summary_msg)
         
         # 最新の user メッセージのインデックスを特定
         latest_user_idx = None
@@ -1819,6 +1869,207 @@ class Agent:
         
         return content_parts
     
+    def export_compaction_state(self) -> dict:
+        return {
+            "conversation_summary": self.history.conversation_summary,
+            "summary_updated_at": self.history.summary_updated_at,
+            "message_count": len(self.history.messages),
+        }
+
+    def apply_compaction_state(self, state: dict | None) -> None:
+        if not state:
+            return
+        self.history.set_conversation_summary(
+            state.get("conversation_summary", ""),
+            state.get("summary_updated_at", "")
+        )
+
+    def _split_messages_for_compaction(self) -> tuple[list[dict], list[dict]]:
+        system_msgs = [m for m in self.history.messages if m.get("role") == "system"]
+        non_system = [m for m in self.history.messages if m.get("role") != "system"]
+        recent_budget = min(
+            self.config.recent_history_tokens,
+            max(1000, self.config.compact_target_tokens - self.config.summary_budget_tokens)
+        )
+
+        recent_reversed = []
+        recent_tokens = 0
+        for msg in reversed(non_system):
+            msg_tokens = self.history._estimate_messages_tokens([msg])
+            if recent_reversed and recent_tokens + msg_tokens > recent_budget:
+                break
+            recent_reversed.append(msg)
+            recent_tokens += msg_tokens
+
+        recent = list(reversed(recent_reversed))
+        old_count = max(0, len(non_system) - len(recent))
+        old = non_system[:old_count]
+
+        if recent:
+            recent = self.history._repair_tool_message_pairs(system_msgs + recent)
+            recent = [m for m in recent if m.get("role") != "system"]
+
+        return old, recent
+
+    def _format_messages_for_summary(self, messages: list[dict]) -> str:
+        formatted = []
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            name = msg.get("name") or ""
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif isinstance(item, dict) and item.get("type") == "image_url":
+                        text_parts.append("[image attachment]")
+                content = "\n".join(text_parts)
+            elif content is None:
+                content = ""
+            if msg.get("tool_calls"):
+                calls = []
+                for tc in msg.get("tool_calls", []):
+                    func = tc.get("function", {})
+                    calls.append(f"{func.get('name', '')}({func.get('arguments', '')})")
+                content = (str(content) + "\nTool calls: " + "; ".join(calls)).strip()
+            label = f"{role}:{name}" if name else role
+            formatted.append(f"[{label}]\n{str(content)[:12000]}")
+        return "\n\n".join(formatted)
+
+    async def _compact_history_if_needed(self) -> None:
+        messages_with_summary = self.history._with_summary_message(self.history.messages)
+        current_tokens = self.history._estimate_messages_tokens(messages_with_summary)
+        if current_tokens < self.config.compact_trigger_tokens:
+            return
+
+        old_messages, recent_messages = self._split_messages_for_compaction()
+        if not old_messages:
+            return
+
+        compaction_start = time.perf_counter()
+        logger.info(
+            f"Conversation compaction started: tokens={current_tokens}, "
+            f"old_messages={len(old_messages)}, recent_messages={len(recent_messages)}"
+        )
+
+        try:
+            summary_start = time.perf_counter()
+            new_summary = await self._summarize_messages_for_compaction(old_messages)
+            logger.info(
+                f"[計測] 会話圧縮: 要約LLM呼び出し時間={time.perf_counter() - summary_start:.2f}s, "
+                f"summary_chars={len(new_summary)}"
+            )
+        except Exception as e:
+            logger.warning(f"Conversation compaction failed; falling back to local summary: {e}")
+            fallback_start = time.perf_counter()
+            new_summary = self._local_fallback_summary(old_messages)
+            logger.info(
+                f"[計測] 会話圧縮: ローカル要約時間={time.perf_counter() - fallback_start:.2f}s, "
+                f"summary_chars={len(new_summary)}"
+            )
+
+        self.history.set_conversation_summary(
+            new_summary,
+            datetime.now(timezone.utc).isoformat()
+        )
+
+        system_msgs = [m for m in self.history.messages if m.get("role") == "system"]
+        self.history.messages = system_msgs + recent_messages
+
+        final_tokens = self.history._estimate_messages_tokens(
+            self.history._with_summary_message(self.history.messages)
+        )
+        logger.info(
+            f"Conversation compaction complete: {current_tokens}->{final_tokens} tokens, "
+            f"messages={len(self.history.messages)}, elapsed={time.perf_counter() - compaction_start:.2f}s"
+        )
+
+    async def _summarize_messages_for_compaction(self, old_messages: list[dict]) -> str:
+        existing_summary = self.history.conversation_summary.strip()
+        transcript = self._format_messages_for_summary(old_messages)
+        max_summary_chars = max(1200, self.config.summary_budget_tokens * 3)
+
+        prompt = f"""
+You are maintaining long-term memory for an assistant conversation.
+Create or update a compact summary that lets the assistant continue the same thread without reading the full old transcript.
+
+Keep:
+- user goals and preferences
+- decisions already made
+- current task status
+- important files, paths, commands, configuration values, and errors
+- tool results only as conclusions, not raw dumps
+- open questions and next steps
+
+Drop:
+- repeated wording, greetings, raw logs, long file contents, and obsolete failed attempts
+
+Existing summary:
+{existing_summary if existing_summary else "(none)"}
+
+Old transcript to fold into the summary:
+{transcript}
+
+Return only the updated summary. Keep it under about {max_summary_chars} characters.
+""".strip()
+
+        request_body = {
+            "model": self.config.model_name,
+            "messages": [
+                {"role": "system", "content": "You write concise, faithful conversation memory."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.1,
+            "max_tokens": min(4096, max(1024, self.config.summary_budget_tokens))
+        }
+
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key and self.config.api_key != "optional_key_here":
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+
+        timeout = httpx.Timeout(self.config.inference_timeout_seconds)
+        _client_kwargs = {"timeout": timeout}
+        _base_hostname = urlparse(self.config.base_url).hostname if self.config.base_url else None
+        if should_bypass_proxy(_base_hostname):
+            _client_kwargs["proxy"] = None
+            _client_kwargs["trust_env"] = False
+
+        async with httpx.AsyncClient(**_client_kwargs) as client:
+            response = await client.post(
+                f"{self.config.base_url}/chat/completions",
+                headers=headers,
+                json=request_body
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        parsed = self._parse_llm_response(data)
+        summary = (parsed.content or "").strip()
+        if not summary:
+            raise ValueError("summary response was empty")
+        return summary[:max_summary_chars]
+
+    def _local_fallback_summary(self, old_messages: list[dict]) -> str:
+        existing = self.history.conversation_summary.strip()
+        snippets = []
+        for msg in old_messages[-12:]:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = "[multimodal message]"
+            elif content is None:
+                content = ""
+            snippets.append(f"- {role}: {str(content).replace(chr(10), ' ')[:500]}")
+
+        fallback = "\n".join([
+            existing,
+            "",
+            "Recent compacted context:",
+            *snippets
+        ]).strip()
+        return fallback[:max(1200, self.config.summary_budget_tokens * 3)]
+
     async def _call_llm(self, user_input: str = None) -> LLMResponse:
         """
         LLMへのAPI呼び出し
@@ -1831,9 +2082,15 @@ class Agent:
         Returns:
             LLM応答
         """
+        llm_call_start = time.perf_counter()
+        compaction_check_start = time.perf_counter()
+        await self._compact_history_if_needed()
+        logger.info(f"[計測] LLM前処理: 会話圧縮チェック時間={time.perf_counter() - compaction_check_start:.2f}s")
+
         # ツール定義を取得（フィルタリング設定を適用）
         # サーバー名が指定されている場合は該当サーバーのツールのみを取得
         # ツール定義予算を渡して動的調整を有効化
+        tools_start = time.perf_counter()
         tools = await self.mcp_manager.get_tools_for_llm(
             user_input=user_input,
             max_tools=self.config.max_tools if self.config.tool_filter_enabled else None,
@@ -1842,6 +2099,7 @@ class Agent:
             server_name=getattr(self, '_server_name', None),
             tool_definition_budget_tokens=self.config.tool_definition_budget_tokens
         )
+        tools_elapsed = time.perf_counter() - tools_start
         
         # リクエストボディを構築
         messages = self.history.get_context_for_llm()
@@ -1869,7 +2127,7 @@ class Agent:
         try:
             from tools import _estimate_tool_definition_tokens
             tool_tokens = _estimate_tool_definition_tokens(tools)
-            message_tokens = self.history._estimate_total_tokens()
+            message_tokens = self.history._estimate_messages_tokens(messages)
             total_estimated = tool_tokens + message_tokens
             logger.info(
                 f"LLMリクエスト推定トークン数: ツール定義={tool_tokens}, "
@@ -1877,6 +2135,12 @@ class Agent:
                 f"（予算: ツール={self.config.tool_definition_budget_tokens}, "
                 f"メッセージ={self.config.message_history_budget_tokens}, "
                 f"全体={self.config.max_context_tokens}）"
+            )
+            logger.info(
+                f"[計測] LLMリクエスト準備: tools_build={tools_elapsed:.2f}s, "
+                f"messages={len(messages)}, tools={len(tools)}, "
+                f"message_tokens={message_tokens}, tool_tokens={tool_tokens}, total_tokens={total_estimated}, "
+                f"max_tokens={self.config.max_tokens}, model={self.config.model_name}"
             )
         except Exception as e:
             logger.debug(f"リクエストトークン数推定に失敗: {e}")
@@ -1901,6 +2165,7 @@ class Agent:
         async with httpx.AsyncClient(**_client_kwargs) as client:
             try:
                 logger.debug(f"LLMリクエスト送信: {self.config.base_url}/chat/completions")
+                http_start = time.perf_counter()
                 response = await client.post(
                     f"{self.config.base_url}/chat/completions",
                     headers=headers,
@@ -1909,8 +2174,19 @@ class Agent:
                 
                 response.raise_for_status()
                 data = response.json()
-                
-                return self._parse_llm_response(data)
+                http_elapsed = time.perf_counter() - http_start
+                total_elapsed = time.perf_counter() - llm_call_start
+                parsed = self._parse_llm_response(data)
+                usage = data.get("usage", {}) if isinstance(data, dict) else {}
+                logger.info(
+                    f"[計測] LLM応答: http_time={http_elapsed:.2f}s, total_time={total_elapsed:.2f}s, "
+                    f"finish_reason={parsed.finish_reason}, content_chars={len(parsed.content or '')}, "
+                    f"thinking_chars={len(parsed.thinking or '')}, tool_calls={len(parsed.tool_calls)}, "
+                    f"prompt_tokens={usage.get('prompt_tokens', 'N/A')}, "
+                    f"completion_tokens={usage.get('completion_tokens', 'N/A')}, "
+                    f"total_tokens={usage.get('total_tokens', 'N/A')}"
+                )
+                return parsed
                 
             except httpx.HTTPStatusError as e:
                 logger.error(f"LLM API HTTPエラー: {e}")
@@ -2097,6 +2373,11 @@ class Agent:
         """
         # タイムアウト付きでツール実行
         # サーバー名はcall_tool内で自動的に検索される
+        tool_start = time.perf_counter()
+        logger.info(
+            f"[計測] ツール実行開始: name={tool_call.name}, "
+            f"args_chars={len(json.dumps(tool_call.arguments, ensure_ascii=False))}"
+        )
         result = await asyncio.wait_for(
             self.mcp_manager.call_tool(
                 server_name="",  # call_tool内で適切なサーバーを自動検索
@@ -2104,6 +2385,11 @@ class Agent:
                 arguments=tool_call.arguments
             ),
             timeout=self.config.tool_execution_timeout_seconds
+        )
+        result_chars = len(self._summarize_tool_result(tool_call.name, result))
+        logger.info(
+            f"[計測] ツール実行完了: name={tool_call.name}, elapsed={time.perf_counter() - tool_start:.2f}s, "
+            f"result_chars={result_chars}, history_tokens_before_add={self.history._estimate_total_tokens()}"
         )
         
         return result
